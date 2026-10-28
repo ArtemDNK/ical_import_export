@@ -13,7 +13,7 @@
 
 ## Требования
 
-- ОС Windows
+- ОС Windows (x86 или x64). Установка .NET не требуется: exe собран как самодостаточное приложение на .NET 10
 - Exchange версии 2013 или выше
 - Учётная запись с правами доступа к почтовым ящикам (см. раздел "Настройка прав доступа")
 
@@ -146,12 +146,20 @@ New-ManagementRoleAssignment -Name "AppImp-svcEws-Scoped" -Role "ApplicationImpe
 
 ## Использование
 
-1. Скопируйте ExchangeCalendarMigrator.exe, config.cfg, input_mailboxes.txt из каталога [publish](https://github.com/alavret/ews2ya360/tree/main/ExchangeCalendarMigrator/Publish) в каталог на компюьтере с ОС Windows который имеет доступ по сети к Exchange серверу.
+1. Скопируйте `ExchangeCalendarMigrator.exe` и `config.cfg` из каталога [`Publish`](Publish/) в каталог на компьютере с ОС Windows, у которого есть сетевой доступ к серверу Exchange.
 2. Создайте каталог, куда будет выгружаться список ics файлов.
 3. Отредактируйте `config.cfg`, указав параметры подключения к Exchange
 4. Создайте или отредактируйте файл `input_mailboxes.txt` со списком ящиков для экспорта
 5. Запустите `ExchangeCalendarMigrator.exe`
 6. Экспортированные ICS-файлы будут сохранены в каталоге, указанном в параметре `output_dir`
+
+### Коды завершения
+
+| Код | Значение |
+|-----|----------|
+| `0` | Все ящики выгружены без ошибок |
+| `1` | Критическая ошибка (нет конфигурации, недоступен EWS и т.п.) — см. `export_ics.log` |
+| `2` | Выгрузка завершена, но для части ящиков (или части диапазонов дат) были ошибки — см. `export_ics.log` |
 
 ## Выходные файлы
 
@@ -164,6 +172,20 @@ New-ManagementRoleAssignment -Name "AppImp-svcEws-Scoped" -Role "ApplicationImpe
 Например: `user@domain.ru_1.ics`, `user@domain.ru_2.ics`
 
 Разбиение на несколько файлов происходит при превышении лимита `file_max_size`.
+
+## Сборка из исходного кода
+
+Готовый `Publish/ExchangeCalendarMigrator.exe` собирается автоматически GitHub Actions (workflow [`build-exporter.yml`](../.github/workflows/build-exporter.yml)) при каждом изменении в каталоге `source/` и коммитится в ту же ветку. Сборку можно запустить и вручную на вкладке **Actions** → **Build ExchangeCalendarMigrator** → **Run workflow**.
+
+Для локальной сборки нужен [.NET SDK 10](https://dotnet.microsoft.com/download/dotnet/10.0):
+
+```powershell
+cd export_ical_by_ews\source
+dotnet publish -c Release -o publish_out
+copy publish_out\ExchangeCalendarMigrator.exe ..\Publish\
+```
+
+Параметры сборки заданы в `ExchangeCalendarMigrator.csproj`: .NET 10, `win-x86`, самодостаточный однофайловый exe (`SelfContained`, `PublishSingleFile`), библиотека EWS — пакет `Exchange.WebServices.Managed.Api`.
 
 ## Логирование
 

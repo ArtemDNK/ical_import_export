@@ -13,7 +13,7 @@
 Консольное приложение на C# для массового экспорта календарных событий из Microsoft Exchange в формат ICS через EWS (Exchange Web Services). Поддерживает подключение через Autodiscover или прямой EWS URL, параллельную обработку нескольких ящиков и работу от имени администратора (Full Access или Application Impersonation).
 
 **Ключевые характеристики:**
-- Платформа: Windows (.NET 8.0)
+- Платформа: Windows (x86/x64). Приложение собрано как самодостаточный exe на .NET 10 — устанавливать .NET не нужно
 - Требования: Exchange 2013+
 - Аутентификация: учётная запись с Full Access или ролью ApplicationImpersonation
 - Вход: список SMTP-адресов (`input_mailboxes.txt`)
@@ -40,6 +40,7 @@ Python-скрипт для экспорта и импорта календарн
 4. Просмотр слоёв календарей пользователей
 5. Парсинг ICS-файлов в каталоге (CSV-отчёт)
 6. Применение правил модификации к ICS-файлам
+7. Импорт событий для всех пользователей организации без дополнительных вопросов
 8. Настройка правил обработки писем для блокировки уведомлений об удалении событий
 9. Настройка сервисного приложения
 
@@ -96,9 +97,9 @@ Python-скрипт для экспорта и импорта календарн
 
 ### 1. Экспорт из Exchange
 
-1. Скопируйте `ExchangeCalendarMigrator.exe`, `config.cfg` и `input_mailboxes.txt` из каталога [`export_ical_by_ews/Publish/`](export_ical_by_ews/Publish/) на Windows-машину с сетевым доступом к Exchange.
+1. Скопируйте `ExchangeCalendarMigrator.exe` и `config.cfg` из каталога [`export_ical_by_ews/Publish/`](export_ical_by_ews/Publish/) на Windows-машину с сетевым доступом к Exchange.
 2. Укажите в `config.cfg` параметры подключения (EWS URL или Autodiscover, учётные данные).
-3. Перечислите ящики для экспорта в `input_mailboxes.txt`.
+3. Создайте рядом файл `input_mailboxes.txt` и перечислите в нём ящики для экспорта.
 4. Запустите `ExchangeCalendarMigrator.exe`.
 5. ICS-файлы с событиями будут сохранены в каталог `output_dir`.
 
@@ -186,10 +187,12 @@ user2;user2@domain.ru;P@ssw0rd!123
 
 ```
 ical_import_export/
+├── .github/workflows/
+│   └── build-exporter.yml           # Автосборка ExchangeCalendarMigrator.exe
 ├── export_ical_by_ews/              # Экспорт из Exchange (C#)
 │   ├── Publish/                     # Готовое приложение и конфигурация
-│   │   ├── config.cfg
-│   │   └── input_mailboxes.txt
+│   │   ├── ExchangeCalendarMigrator.exe
+│   │   └── config.cfg
 │   ├── source/                      # Исходный код
 │   │   ├── Program.cs
 │   │   ├── ExchangeCalendarMigrator.csproj
@@ -201,6 +204,8 @@ ical_import_export/
 │   ├── .env                         # Конфигурация (токены, параметры)
 │   ├── users.csv                    # Список пользователей Яндекс 360
 │   ├── external_caldav_users.csv    # Учётные данные внешнего CalDAV
-│   └── ical_modify_rules.txt        # Правила модификации ICS-файлов
+│   ├── user_mapping.txt             # Маппинг пользователей (внешняя система → Яндекс 360)
+│   ├── ical_modify_rules.txt        # Правила модификации ICS-файлов
+│   └── README.md
 └── README.md                        # Этот файл
 ```
