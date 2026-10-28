@@ -10,6 +10,7 @@ using System.Net.Security;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Exchange.WebServices.Autodiscover;
 using Microsoft.Exchange.WebServices.Data;
 
 internal sealed class Program
