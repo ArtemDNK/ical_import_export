@@ -16,6 +16,9 @@ internal sealed class Program
 {
     private static int Main(string[] args)
     {
+        // .NET (Core) ships without legacy code pages (windows-1251, koi8-r, ...) unless the provider
+        // is registered; otherwise Encoding.GetEncoding(...) throws on such MIME content.
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         PatchEwsBuildVersion();
 
         var baseDir = AppContext.BaseDirectory;
@@ -34,7 +37,13 @@ internal sealed class Program
             }
 
             var exporter = new CalendarExporter(config, logger);
-            exporter.Run();
+            var failed = exporter.Run();
+            if (failed > 0)
+            {
+                logger.Warn($"Export finished with errors: {failed} of {config.Mailboxes.Count} mailbox(es) failed.");
+                return 2;
+            }
+
             return 0;
         }
         catch (Exception ex)
@@ -171,13 +180,14 @@ internal sealed record AppConfig(
             return settings.TryGetValue(key, out var value) ? value : fallback;
         }
 
-        var autodiscoverUrl = GetSetting("audiscovery_url");
+        // "audiscovery_url" is the historical (misspelled) key and is still accepted for compatibility.
+        var autodiscoverUrl = GetSetting("autodiscover_url", GetSetting("audiscovery_url"));
         var ewsUrl = GetSetting("ews_url");
         var inputFile = GetSetting("input_file", "input_mailboxes.txt");
         var outputDir = GetSetting("output_dir", "output");
         var superAdmin = GetSetting("superadmin");
         var superAdminPass = GetSetting("superadmin_pass");
-        var daysAgo = ParseInt(GetSetting("days_ago"), "days_ago");
+        var daysAgo = ParseInt(GetSetting("days_ago"), "days_ago", 30);
         var fileMaxSizeMb = ParseInt(GetSetting("file_max_size"), "file_max_size", 10);
         var allowUntrustedConnections = ParseBool(GetSetting("allow_untrusted_connections"), false);
         var exchangeTimeZone = ParseTimeZoneShift(GetSetting("exchange_timezone_shift", "+0"));
@@ -313,13 +323,30 @@ internal sealed record AppConfig(
             throw new InvalidOperationException("Parameter 'exchange_timezone_shift' must start with '+' or '-' (e.g., +3 or -5).");
         }
 
-        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var hours))
+        // Accepted formats: +N, -N and +H:MM (e.g. +5:30)
+        var sign = value[0] == '-' ? -1 : 1;
+        var body = value[1..];
+        var parts = body.Split(':');
+        if (parts.Length > 2 ||
+            !int.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var hours) ||
+            hours > 14)
         {
-            throw new InvalidOperationException($"Parameter 'exchange_timezone_shift' has invalid format: '{value}'. Expected format: +N or -N (e.g., +3 or -5).");
+            throw new InvalidOperationException($"Parameter 'exchange_timezone_shift' has invalid format: '{value}'. Expected format: +N, -N or +H:MM (e.g., +3, -5, +5:30).");
         }
 
-        var tzName = hours >= 0 ? $"UTC+{hours}" : $"UTC{hours}";
-        return TimeZoneInfo.CreateCustomTimeZone(tzName, TimeSpan.FromHours(hours), tzName, tzName);
+        var minutes = 0;
+        if (parts.Length == 2 &&
+            (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out minutes) || minutes > 59))
+        {
+            throw new InvalidOperationException($"Parameter 'exchange_timezone_shift' has invalid minutes: '{value}'.");
+        }
+
+        var offset = new TimeSpan(sign * hours, sign * minutes, 0);
+        var signChar = sign < 0 ? '-' : '+';
+        var tzName = minutes == 0
+            ? $"UTC{signChar}{hours}"
+            : $"UTC{signChar}{hours}:{minutes:D2}";
+        return TimeZoneInfo.CreateCustomTimeZone(tzName, offset, tzName, tzName);
     }
 }
 
@@ -354,7 +381,8 @@ internal sealed class CalendarExporter
         };
     }
 
-    public void Run()
+    /// <summary>Exports all mailboxes. Returns the number of mailboxes that failed.</summary>
+    public int Run()
     {
         var ewsUri = ResolveEwsUrl();
         var exchangeTimeZone = _config.ExchangeTimeZone;
@@ -367,18 +395,25 @@ internal sealed class CalendarExporter
             MaxDegreeOfParallelism = THREAD_COUNT
         };
 
+        var failed = 0;
         Parallel.ForEach(_config.Mailboxes, parallelOptions, mailbox =>
         {
             using var scope = _logger.BeginMailboxScope(mailbox);
             try
             {
-                ExportMailbox(ewsUri, exchangeTimeZone, mailbox);
+                if (!ExportMailbox(ewsUri, exchangeTimeZone, mailbox))
+                {
+                    Interlocked.Increment(ref failed);
+                }
             }
             catch (Exception ex)
             {
+                Interlocked.Increment(ref failed);
                 _logger.Error(WithMailbox(mailbox, $"Failed to export mailbox: {ex.Message}"), ex);
             }
         });
+
+        return failed;
     }
 
     private Uri ResolveEwsUrl()
@@ -405,12 +440,17 @@ internal sealed class CalendarExporter
 
                 if (response.ErrorCode == AutodiscoverErrorCode.NoError)
                 {
+                    // Prefer the internal URL and fall back to the external one when it is empty
+                    // (previously an empty InternalEwsUrl prevented ExternalEwsUrl from being used).
                     var urlCandidate =
                         response.Settings.TryGetValue(UserSettingName.InternalEwsUrl, out var internalUrl)
                             ? internalUrl as string
-                            : response.Settings.TryGetValue(UserSettingName.ExternalEwsUrl, out var externalUrl)
-                                ? externalUrl as string
-                                : null;
+                            : null;
+                    if (string.IsNullOrWhiteSpace(urlCandidate) &&
+                        response.Settings.TryGetValue(UserSettingName.ExternalEwsUrl, out var externalUrl))
+                    {
+                        urlCandidate = externalUrl as string;
+                    }
 
                     if (!string.IsNullOrWhiteSpace(urlCandidate))
                     {
@@ -435,20 +475,35 @@ internal sealed class CalendarExporter
         return new Uri(_config.EwsUrl);
     }
 
-    private ExchangeService CreateService(Uri ewsUri, TimeZoneInfo exchangeTimeZone)
+    private ExchangeService CreateService(Uri ewsUri, TimeZoneInfo exchangeTimeZone, string? impersonatedMailbox = null)
     {
-        return new ExchangeService(ExchangeVersion.Exchange2013, exchangeTimeZone)
+        var service = new ExchangeService(ExchangeVersion.Exchange2013, exchangeTimeZone)
         {
             Credentials = new WebCredentials(_config.SuperAdmin, _config.SuperAdminPassword),
             Url = ewsUri,
             TraceEnabled = false,
         };
+
+        if (impersonatedMailbox != null)
+        {
+            service.ImpersonatedUserId = new ImpersonatedUserId(ConnectingIdType.SmtpAddress, impersonatedMailbox);
+        }
+
+        return service;
     }
 
-    private void ExportMailbox(Uri ewsUri, TimeZoneInfo exchangeTimeZone, string mailbox)
+    /// <returns>true when every time range was read without errors.</returns>
+    private bool ExportMailbox(Uri ewsUri, TimeZoneInfo exchangeTimeZone, string mailbox)
     {
         _logger.Info(WithMailbox(mailbox, "Exporting mailbox"));
-        var masterCache = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Resolve the access mode once per mailbox (previously the calendar folder was bound
+        // again in every 30-day chunk, costing an extra EWS round-trip per chunk).
+        var useImpersonation = ResolveAccessMode(ewsUri, exchangeTimeZone, mailbox);
+        var impersonated = useImpersonation ? mailbox : null;
+        var calendarId = useImpersonation
+            ? new FolderId(WellKnownFolderName.Calendar)
+            : new FolderId(WellKnownFolderName.Calendar, new Mailbox(mailbox));
 
         var startDate = DateTime.UtcNow.AddDays(-_config.DaysAgo);
         var endDate = DateTime.UtcNow.AddYears(1);
@@ -475,37 +530,34 @@ internal sealed class CalendarExporter
         // Each thread gets its own ExchangeService (EWS objects are not thread-safe)
         var chunkResults = new ConcurrentBag<List<Appointment>>();
         var chunkParallelOptions = new ParallelOptions { MaxDegreeOfParallelism = THREAD_COUNT };
+        var chunkErrors = 0;
 
         Parallel.ForEach(timeRanges, chunkParallelOptions, range =>
         {
             try
             {
-                var threadService = CreateService(ewsUri, exchangeTimeZone);
-                var calendar = BindCalendarFolder(threadService, mailbox);
-
-                var view = new CalendarView(range.Start, range.End)
-                {
-                    PropertySet = new PropertySet(BasePropertySet.IdOnly)
-                };
-
-                var results = calendar.FindAppointments(view);
+                var threadService = CreateService(ewsUri, exchangeTimeZone, impersonated);
+                var found = FindAppointmentsInRange(threadService, calendarId, range.Start, range.End, mailbox);
                 var loaded = LoadAppointments(
-                    threadService, results, mailbox,
+                    threadService, found, mailbox,
                     $"{mailbox} {range.Start:d}-{range.End:d}");
 
                 chunkResults.Add(loaded.ToList());
             }
             catch (Exception ex)
             {
+                Interlocked.Increment(ref chunkErrors);
                 _logger.Error(WithMailbox(mailbox,
                     $"Failed to read chunk {range.Start:d}-{range.End:d}: {ex.Message}"), ex);
             }
         });
 
         // Deduplicate collected appointments on the main thread
-        var service = CreateService(ewsUri, exchangeTimeZone);
+        var service = CreateService(ewsUri, exchangeTimeZone, impersonated);
         var itemsToExport = new List<Appointment>();
         var uniqueIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var masterCache = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var failedMasters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var chunkAppointments in chunkResults)
         {
@@ -518,17 +570,17 @@ internal sealed class CalendarExporter
 
                 var appointmentType = appointment.AppointmentType;
 
-                if (appointmentType == AppointmentType.RecurringMaster &&
-                    !string.IsNullOrWhiteSpace(appointment.ICalUid) &&
-                    masterCache.Contains(appointment.ICalUid))
-                {
-                    continue;
-                }
-
                 if (appointmentType == AppointmentType.Occurrence ||
                     appointmentType == AppointmentType.Exception)
                 {
-                    TryAddRecurringMaster(service, appointment, itemsToExport, masterCache, mailbox);
+                    TryAddRecurringMaster(service, appointment, itemsToExport, masterCache, failedMasters, mailbox);
+                    continue;
+                }
+
+                if (appointmentType == AppointmentType.RecurringMaster &&
+                    !string.IsNullOrWhiteSpace(appointment.ICalUid) &&
+                    !masterCache.Add(appointment.ICalUid))
+                {
                     continue;
                 }
 
@@ -539,39 +591,74 @@ internal sealed class CalendarExporter
                 }
 
                 itemsToExport.Add(appointment);
-
-                if (appointmentType == AppointmentType.RecurringMaster &&
-                    !string.IsNullOrWhiteSpace(appointment.ICalUid))
-                {
-                    masterCache.Add(appointment.ICalUid);
-                }
             }
         }
 
         WriteIcsFiles(mailbox, itemsToExport);
+        return chunkErrors == 0;
     }
 
-    private CalendarFolder BindCalendarFolder(ExchangeService service, string mailbox)
+    /// <summary>
+    /// Checks access to the calendar (Full Access / delegation). If the folder is not found or access
+    /// is denied, falls back to impersonation. Returns true when impersonation is required.
+    /// </summary>
+    private bool ResolveAccessMode(Uri ewsUri, TimeZoneInfo exchangeTimeZone, string mailbox)
     {
-        var calendarId = new FolderId(WellKnownFolderName.Calendar, new Mailbox(mailbox));
+        var service = CreateService(ewsUri, exchangeTimeZone);
         try
         {
-            return CalendarFolder.Bind(service, calendarId);
+            CalendarFolder.Bind(service, new FolderId(WellKnownFolderName.Calendar, new Mailbox(mailbox)), PropertySet.IdOnly);
+            return false;
         }
-        catch (ServiceResponseException ex) when (ex.ErrorCode == ServiceError.ErrorFolderNotFound)
+        catch (ServiceResponseException ex) when (
+            ex.ErrorCode == ServiceError.ErrorFolderNotFound ||
+            ex.ErrorCode == ServiceError.ErrorAccessDenied)
         {
-            _logger.Warn(WithMailbox(mailbox, "Calendar folder not found. Retrying with impersonation."));
-            service.ImpersonatedUserId = new ImpersonatedUserId(ConnectingIdType.SmtpAddress, mailbox);
-            try
-            {
-                return CalendarFolder.Bind(service, WellKnownFolderName.Calendar);
-            }
-            catch
-            {
-                service.ImpersonatedUserId = null;
-                throw;
-            }
+            _logger.Warn(WithMailbox(mailbox, $"Calendar folder not accessible ({ex.ErrorCode}). Retrying with impersonation."));
         }
+
+        // Make sure impersonation actually works; any exception propagates to the caller
+        var impersonatedService = CreateService(ewsUri, exchangeTimeZone, mailbox);
+        CalendarFolder.Bind(impersonatedService, WellKnownFolderName.Calendar, PropertySet.IdOnly);
+        return true;
+    }
+
+    /// <summary>
+    /// FindAppointments guarded against truncation: Exchange returns at most EWSFindCountLimit
+    /// (1000 by default) items per request and silently drops the rest. When more items are
+    /// available, the range is split in half recursively.
+    /// </summary>
+    private List<Appointment> FindAppointmentsInRange(
+        ExchangeService service,
+        FolderId calendarId,
+        DateTime start,
+        DateTime end,
+        string mailbox)
+    {
+        var view = new CalendarView(start, end)
+        {
+            PropertySet = new PropertySet(BasePropertySet.IdOnly)
+        };
+
+        var results = service.FindAppointments(calendarId, view);
+        if (!results.MoreAvailable)
+        {
+            return results.Items.ToList();
+        }
+
+        if (end - start <= TimeSpan.FromHours(1))
+        {
+            _logger.Warn(WithMailbox(mailbox,
+                $"Range {start:u}-{end:u} returned a truncated result ({results.Items.Count} items); some appointments may be missing."));
+            return results.Items.ToList();
+        }
+
+        var middle = start + TimeSpan.FromTicks((end - start).Ticks / 2);
+        _logger.Debug(WithMailbox(mailbox, $"Range {start:u}-{end:u} is truncated, splitting at {middle:u}"));
+
+        var combined = FindAppointmentsInRange(service, calendarId, start, middle, mailbox);
+        combined.AddRange(FindAppointmentsInRange(service, calendarId, middle, end, mailbox));
+        return combined;
     }
 
     private void TryAddRecurringMaster(
@@ -579,20 +666,19 @@ internal sealed class CalendarExporter
         Appointment appointment,
         List<Appointment> target,
         HashSet<string> masterCache,
+        HashSet<string> failedMasters,
         string mailbox)
     {
-        if (appointment.AppointmentType == AppointmentType.RecurringMaster)
+        var uid = appointment.ICalUid;
+        if (string.IsNullOrWhiteSpace(uid))
         {
+            _logger.Warn(WithMailbox(mailbox, $"Skipping recurring item without UID: {appointment.Id?.UniqueId}"));
             return;
         }
 
-        if (appointment.AppointmentType != AppointmentType.Occurrence &&
-            appointment.AppointmentType != AppointmentType.Exception)
-        {
-            return;
-        }
-
-        if (string.IsNullOrWhiteSpace(appointment.ICalUid) || masterCache.Contains(appointment.ICalUid))
+        // The master was already added or already failed to load: don't hit EWS again
+        // for every occurrence of the series.
+        if (masterCache.Contains(uid) || failedMasters.Contains(uid))
         {
             return;
         }
@@ -605,22 +691,27 @@ internal sealed class CalendarExporter
             if (master.AppointmentType == AppointmentType.RecurringMaster)
             {
                 target.Add(master);
-                masterCache.Add(appointment.ICalUid);
-                _logger.Debug(WithMailbox(mailbox, $"Added recurrence master for UID {appointment.ICalUid}"));
+                masterCache.Add(uid);
+                _logger.Debug(WithMailbox(mailbox, $"Added recurrence master for UID {uid}"));
+                return;
             }
+
+            _logger.Warn(WithMailbox(mailbox, $"Item bound as recurrence master for UID {uid} has type {master.AppointmentType}, skipping series."));
         }
         catch (ServiceResponseException ex)
         {
-            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {appointment.ICalUid}: {ex.ErrorCode} - {ex.Message}"));
+            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {uid}: {ex.ErrorCode} - {ex.Message}"));
         }
         catch (ServiceRequestException ex)
         {
-            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {appointment.ICalUid}: request failed - {ex.Message}"));
+            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {uid}: request failed - {ex.Message}"));
         }
         catch (Exception ex)
         {
-            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {appointment.ICalUid}: unexpected error - {ex.Message}"));
+            _logger.Warn(WithMailbox(mailbox, $"Could not load recurrence master for UID {uid}: unexpected error - {ex.Message}"));
         }
+
+        failedMasters.Add(uid);
     }
 
     private void WriteIcsFiles(string mailbox, IEnumerable<Appointment> appointments)
@@ -663,7 +754,7 @@ internal sealed class CalendarExporter
 
         for (var offset = 0; offset < list.Count; offset += batchSize)
         {
-            var batch = list.Skip(offset).Take(batchSize).ToList();
+            var batch = list.GetRange(offset, Math.Min(batchSize, list.Count - offset));
             ServiceResponseCollection<ServiceResponse>? responses = null;
 
             try
@@ -708,51 +799,76 @@ internal sealed class CalendarExporter
 
 internal sealed class IcsBatchWriter
 {
+    private const string Crlf = "\r\n";
+    private const string Footer = "END:VCALENDAR";
+
+    // UTF-8 without BOM: Encoding.UTF8 writes a BOM, so the first line became
+    // "<BOM>BEGIN:VCALENDAR", which breaks some parsers.
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private readonly string _mailboxId;
     private readonly string _mailboxSafeName;
     private readonly string _outputDir;
-    private readonly int _maxBytes;
+    private readonly long _maxBytes;
     private readonly Logger _logger;
 
     private readonly StringBuilder _builder = new();
-    private readonly HashSet<string> _timezones = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _timezones = new(StringComparer.Ordinal);
     private int _fileCounter = 1;
     private int _eventCount;
+    private long _currentBytes;
 
     public IcsBatchWriter(string mailbox, string outputDir, int fileMaxSizeMb, Logger logger)
     {
         _mailboxId = mailbox;
         _mailboxSafeName = SanitizeFileName(mailbox);
         _outputDir = outputDir;
-        _maxBytes = fileMaxSizeMb * 1024 * 1024;
+        _maxBytes = (long)fileMaxSizeMb * 1024 * 1024;
         _logger = logger;
         StartNewFile();
     }
 
     public void AppendFromAppointment(Appointment appointment)
     {
-        var charset = string.IsNullOrWhiteSpace(appointment.MimeContent.CharacterSet)
-            ? Encoding.UTF8
-            : Encoding.GetEncoding(appointment.MimeContent.CharacterSet);
-
-        var raw = charset.GetString(appointment.MimeContent.Content);
+        var raw = DecodeMime(appointment.MimeContent);
         var blocks = IcsBlockExtractor.Extract(raw);
 
-        foreach (var tz in blocks.Timezones)
-        {
-            AppendBlock(tz, isTimezone: true);
-        }
+        var timezones = blocks.Timezones
+            .Select(IcsLineFolder.UnfoldAndFoldBlock)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
 
         foreach (var evt in blocks.Events)
         {
             var withParticipants = IcsEventAugmenter.EnsureParticipants(evt, appointment, _logger, _mailboxId);
-            AppendBlock(withParticipants, isTimezone: false);
+            AppendEvent(IcsLineFolder.UnfoldAndFoldBlock(withParticipants), timezones);
         }
     }
 
     public void Complete()
     {
-        Flush(forceWrite: false, startNew: false);
+        if (_eventCount > 0)
+        {
+            WriteFile();
+        }
+    }
+
+    private string DecodeMime(MimeContent mime)
+    {
+        var encoding = Encoding.UTF8;
+        if (!string.IsNullOrWhiteSpace(mime.CharacterSet))
+        {
+            try
+            {
+                encoding = Encoding.GetEncoding(mime.CharacterSet.Trim());
+            }
+            catch (ArgumentException)
+            {
+                _logger.Warn(WithMailboxPrefix($"Unknown MIME charset '{mime.CharacterSet}', falling back to UTF-8."));
+            }
+        }
+
+        return encoding.GetString(mime.Content).TrimStart('\uFEFF');
     }
 
     private void StartNewFile()
@@ -760,73 +876,88 @@ internal sealed class IcsBatchWriter
         _builder.Clear();
         _timezones.Clear();
         _eventCount = 0;
+        _currentBytes = 0;
 
-        _builder.AppendLine("BEGIN:VCALENDAR");
-        _builder.AppendLine("VERSION:2.0");
-        _builder.AppendLine("PRODID:-//ExchangeCalendarMigrator//EN");
-        _builder.AppendLine("METHOD:PUBLISH");
+        AppendRaw("BEGIN:VCALENDAR");
+        AppendRaw("VERSION:2.0");
+        AppendRaw("PRODID:-//ExchangeCalendarMigrator//EN");
+        AppendRaw("METHOD:PUBLISH");
     }
 
-    private void AppendBlock(string block, bool isTimezone)
+    /// <summary>
+    /// Appends a VEVENT together with the VTIMEZONE blocks it needs. When a new file is started,
+    /// the event's time zones are written again (previously the event that triggered the split
+    /// landed in the new file without its VTIMEZONE, so its TZID pointed to an undefined zone).
+    /// </summary>
+    private void AppendEvent(string eventBlock, IReadOnlyList<string> timezones)
     {
-        block = IcsLineFolder.UnfoldAndFoldBlock(block);
-        if (isTimezone && _timezones.Contains(block))
+        var footerBytes = LineBytes(Footer);
+        var eventBytes = LineBytes(eventBlock);
+        var projected = _currentBytes + MissingTimezoneBytes(timezones) + eventBytes + footerBytes;
+
+        if (projected > _maxBytes && _eventCount > 0)
         {
+            WriteFile();
+            StartNewFile();
+            projected = _currentBytes + MissingTimezoneBytes(timezones) + eventBytes + footerBytes;
+        }
+
+        if (projected > _maxBytes)
+        {
+            _logger.Warn(WithMailboxPrefix($"Skipping event block for {_mailboxSafeName}: exceeds file_max_size limit."));
             return;
         }
 
-        var blockBytes = Encoding.UTF8.GetByteCount(block + "\r\n");
-        var footerBytes = Encoding.UTF8.GetByteCount("END:VCALENDAR\r\n");
-
-        var projectedBytes = CurrentBytes + blockBytes + footerBytes;
-        if (projectedBytes > _maxBytes && (_eventCount > 0 || _timezones.Count > 0))
+        foreach (var tz in timezones)
         {
-            Flush(forceWrite: true, startNew: true);
-            projectedBytes = CurrentBytes + blockBytes + footerBytes;
+            if (_timezones.Add(tz))
+            {
+                AppendRaw(tz);
+            }
         }
 
-        if (projectedBytes > _maxBytes)
-        {
-            _logger.Warn(WithMailboxPrefix($"Skipping {(isTimezone ? "timezone" : "event")} block for {_mailboxSafeName}: exceeds file_max_size limit."));
-            return;
-        }
-
-        _builder.AppendLine(block);
-
-        if (isTimezone)
-        {
-            _timezones.Add(block);
-        }
-        else
-        {
-            _eventCount++;
-        }
+        AppendRaw(eventBlock);
+        _eventCount++;
     }
 
-    private void Flush(bool forceWrite, bool startNew)
+    private long MissingTimezoneBytes(IReadOnlyList<string> timezones)
     {
-        if (!forceWrite && _eventCount == 0 && _timezones.Count == 0)
+        long total = 0;
+        foreach (var tz in timezones)
         {
-            return;
+            if (!_timezones.Contains(tz))
+            {
+                total += LineBytes(tz);
+            }
         }
 
-        _builder.AppendLine("END:VCALENDAR");
+        return total;
+    }
+
+    // File size is tracked incrementally: previously the whole StringBuilder was converted to
+    // a string and re-encoded for every block (quadratic complexity).
+    private void AppendRaw(string block)
+    {
+        _builder.Append(block).Append(Crlf);
+        _currentBytes += LineBytes(block);
+    }
+
+    private static long LineBytes(string block) => Utf8NoBom.GetByteCount(block) + Crlf.Length;
+
+    private void WriteFile()
+    {
+        _builder.Append(Footer).Append(Crlf);
         var path = Path.Combine(_outputDir, $"{_mailboxSafeName}_{_fileCounter}.ics");
         while (File.Exists(path))
         {
             _fileCounter++;
             path = Path.Combine(_outputDir, $"{_mailboxSafeName}_{_fileCounter}.ics");
         }
-        File.WriteAllText(path, _builder.ToString(), Encoding.UTF8);
+
+        File.WriteAllText(path, _builder.ToString(), Utf8NoBom);
         _logger.Info(WithMailboxPrefix($"Created {path} with {_eventCount} events."));
         _fileCounter++;
-        if (startNew)
-        {
-            StartNewFile();
-        }
     }
-
-    private int CurrentBytes => Encoding.UTF8.GetByteCount(_builder.ToString());
 
     private static string SanitizeFileName(string name)
     {
@@ -840,6 +971,8 @@ internal sealed class IcsBatchWriter
 
 internal static class IcsEventAugmenter
 {
+    private static readonly char[] ParamSpecialChars = { ';', ':', ',' };
+
     public static string EnsureParticipants(string eventBlock, Appointment appointment, Logger logger, string mailbox)
     {
         if (appointment == null || string.IsNullOrWhiteSpace(eventBlock))
@@ -854,8 +987,8 @@ internal static class IcsEventAugmenter
             return eventBlock;
         }
 
-        var hasOrganizer = ContainsLine(normalizedLines, "ORGANIZER");
-        var hasAttendee = ContainsLine(normalizedLines, "ATTENDEE");
+        var hasOrganizer = ContainsProperty(normalizedLines, "ORGANIZER");
+        var hasAttendee = ContainsProperty(normalizedLines, "ATTENDEE");
 
         var toInsert = new List<string>();
 
@@ -885,12 +1018,17 @@ internal static class IcsEventAugmenter
         return string.Join("\r\n", normalizedLines);
     }
 
-    private static bool ContainsLine(IEnumerable<string> lines, string token)
+    // Match the whole property name ("ATTENDEE;..." / "ATTENDEE:..."),
+    // not any line that merely starts with these letters.
+    private static bool ContainsProperty(IEnumerable<string> lines, string name)
     {
-        return lines.Any(l => l.StartsWith(token, StringComparison.OrdinalIgnoreCase));
+        return lines.Any(l =>
+            l.Length > name.Length &&
+            l.StartsWith(name, StringComparison.OrdinalIgnoreCase) &&
+            (l[name.Length] == ';' || l[name.Length] == ':'));
     }
 
-    private static IEnumerable<string> BuildAttendees(IEnumerable<Attendee> attendees, string role)
+    private static IEnumerable<string> BuildAttendees(IEnumerable<Attendee>? attendees, string role)
     {
         var list = new List<string>();
         if (attendees == null)
@@ -905,9 +1043,8 @@ internal static class IcsEventAugmenter
                 continue;
             }
 
-            var cnPart = string.IsNullOrWhiteSpace(attendee.Name) ? string.Empty : $";CN={Escape(attendee.Name)}";
             var partStat = MapResponse(attendee.ResponseType);
-            var line = $"ATTENDEE;ROLE={role};PARTSTAT={partStat}{cnPart}:mailto:{Escape(attendee.Address)}";
+            var line = $"ATTENDEE;ROLE={role};PARTSTAT={partStat}{FormatCn(attendee.Name)}:mailto:{CleanAddress(attendee.Address)}";
             list.AddRange(IcsLineFolder.FoldLines(line));
         }
 
@@ -921,8 +1058,7 @@ internal static class IcsEventAugmenter
             return null;
         }
 
-        var cnPart = string.IsNullOrWhiteSpace(organizer.Name) ? string.Empty : $";CN={Escape(organizer.Name)}";
-        return $"ORGANIZER{cnPart}:mailto:{Escape(organizer.Address)}";
+        return $"ORGANIZER{FormatCn(organizer.Name)}:mailto:{CleanAddress(organizer.Address)}";
     }
 
     private static string MapResponse(MeetingResponseType? responseType)
@@ -936,20 +1072,41 @@ internal static class IcsEventAugmenter
         };
     }
 
-    private static string Escape(string value)
+    /// <summary>
+    /// RFC 5545 parameter value: ; : , are not backslash-escaped in parameters (that is only for
+    /// TEXT property values); the value is wrapped in double quotes instead.
+    /// </summary>
+    private static string FormatCn(string? name)
     {
-        return value
-            .Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace(";", "\\;", StringComparison.Ordinal)
-            .Replace(",", "\\,", StringComparison.Ordinal)
-            .Replace("\n", "\\n", StringComparison.Ordinal)
-            .Replace("\r", string.Empty, StringComparison.Ordinal);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return string.Empty;
+        }
+
+        var cleaned = name
+            .Replace("\r", string.Empty, StringComparison.Ordinal)
+            .Replace("\n", " ", StringComparison.Ordinal)
+            .Replace("\"", "'", StringComparison.Ordinal)
+            .Trim();
+
+        return cleaned.IndexOfAny(ParamSpecialChars) >= 0 ? $";CN=\"{cleaned}\"" : $";CN={cleaned}";
+    }
+
+    // The mailto: address is a URI; TEXT-style escaping (\; \,) corrupts it.
+    private static string CleanAddress(string address)
+    {
+        return address
+            .Replace("\r", string.Empty, StringComparison.Ordinal)
+            .Replace("\n", string.Empty, StringComparison.Ordinal)
+            .Trim();
     }
 }
 
 internal static class IcsLineFolder
 {
-    private const int Limit = 75;
+    // RFC 5545 limits lines to 75 octets (UTF-8 bytes), not 75 characters.
+    private const int LimitOctets = 75;
+    private const int BreakSearchWindow = 20;
 
     public static string UnfoldAndFoldBlock(string block)
     {
@@ -960,23 +1117,24 @@ internal static class IcsLineFolder
 
         var normalized = block.Replace("\r\n", "\n", StringComparison.Ordinal);
         var lines = normalized.Split('\n');
-        var unfolded = new List<string>(lines.Length);
+        var unfolded = new List<StringBuilder>(lines.Length);
 
         foreach (var line in lines)
         {
             if (line.Length > 0 && (line[0] == ' ' || line[0] == '\t') && unfolded.Count > 0)
             {
-                unfolded[unfolded.Count - 1] += line.Substring(1);
+                unfolded[^1].Append(line, 1, line.Length - 1);
             }
             else
             {
-                unfolded.Add(line);
+                unfolded.Add(new StringBuilder(line));
             }
         }
 
         var folded = new List<string>(unfolded.Count * 2);
-        foreach (var line in unfolded)
+        foreach (var sb in unfolded)
         {
+            var line = sb.ToString();
             if (line.Length == 0)
             {
                 folded.Add(line);
@@ -991,7 +1149,7 @@ internal static class IcsLineFolder
 
     public static IEnumerable<string> FoldLines(string line)
     {
-        if (line.Length <= Limit)
+        if (Encoding.UTF8.GetByteCount(line) <= LimitOctets)
         {
             yield return line;
             yield break;
@@ -1003,51 +1161,66 @@ internal static class IcsLineFolder
 
         while (index < line.Length)
         {
-            var availableLength = firstLine ? Limit : Limit - 1; // Reserve space for leading space on continuation lines
-            var remaining = line.Length - index;
+            // Continuation lines start with a space, which also counts as an octet
+            var budget = firstLine ? LimitOctets : LimitOctets - 1;
+            var maxChars = MaxCharsWithinBudget(line, index, budget);
 
-            if (remaining <= availableLength)
+            var take = index + maxChars >= line.Length
+                ? line.Length - index
+                : FindBreakPoint(line, index, maxChars, emailSpans);
+
+            var segment = line.Substring(index, take);
+            yield return firstLine ? segment : " " + segment;
+
+            // Spaces at the break point are NOT skipped any more: they used to be dropped,
+            // so after unfolding words were glued together ("Hello world" -> "Helloworld").
+            index += take;
+            firstLine = false;
+        }
+    }
+
+    /// <summary>How many chars starting at start fit into budget UTF-8 bytes without splitting a surrogate pair.</summary>
+    private static int MaxCharsWithinBudget(string line, int start, int budget)
+    {
+        var bytes = 0;
+        var i = start;
+        while (i < line.Length)
+        {
+            var ch = line[i];
+            int charLen;
+            int charBytes;
+            if (char.IsHighSurrogate(ch) && i + 1 < line.Length && char.IsLowSurrogate(line[i + 1]))
             {
-                var lastSegment = line.Substring(index);
-                if (!firstLine)
-                {
-                    lastSegment = " " + lastSegment;
-                }
-                yield return lastSegment;
+                charLen = 2;
+                charBytes = 4;
+            }
+            else
+            {
+                charLen = 1;
+                charBytes = ch < 0x80 ? 1 : ch < 0x800 ? 2 : 3;
+            }
+
+            if (bytes + charBytes > budget)
+            {
                 break;
             }
 
-            var breakPoint = FindBreakPoint(line, index, availableLength, emailSpans);
-            var segment = line.Substring(index, breakPoint);
-            if (!firstLine)
-            {
-                segment = " " + segment;
-            }
-
-            yield return segment;
-            index += breakPoint;
-
-            while (index < line.Length && line[index] == ' ')
-            {
-                index++;
-            }
-
-            firstLine = false;
+            bytes += charBytes;
+            i += charLen;
         }
+
+        return Math.Max(1, i - start);
     }
 
     private static int FindBreakPoint(
         string line,
         int startIndex,
-        int maxLength,
+        int maxChars,
         IReadOnlyList<(int Start, int End)> emailSpans)
     {
-        var endIndex = startIndex + maxLength;
-        if (endIndex >= line.Length)
-        {
-            return line.Length - startIndex;
-        }
+        var endIndex = startIndex + maxChars;
 
+        // Don't break an e-mail address if it can be moved to the next line as a whole
         foreach (var span in emailSpans)
         {
             if (endIndex > span.Start && endIndex < span.End)
@@ -1057,32 +1230,26 @@ internal static class IcsLineFolder
                     return span.Start - startIndex;
                 }
 
-                return span.End - startIndex;
+                break; // address is longer than a line: split at the limit
             }
         }
 
-        var searchStart = Math.Max(0, maxLength - 20);
-        for (var i = Math.Min(maxLength - 1, line.Length - startIndex - 1); i >= searchStart; i--)
+        var searchStop = Math.Max(startIndex + 1, endIndex - BreakSearchWindow);
+        for (var i = endIndex - 1; i >= searchStop; i--)
         {
-            var absolutePos = startIndex + i;
-            if (absolutePos >= line.Length)
-            {
-                continue;
-            }
-
-            var ch = line[absolutePos];
+            var ch = line[i];
             if (ch == ' ')
             {
-                return i;
+                return i - startIndex; // the space starts the next segment and is preserved
             }
 
             if (ch == ',' || ch == ';')
             {
-                return i + 1;
+                return i + 1 - startIndex;
             }
         }
 
-        return Math.Min(maxLength, line.Length - startIndex);
+        return maxChars;
     }
 
     private static IReadOnlyList<(int Start, int End)> FindEmailSpans(string line)
@@ -1113,6 +1280,8 @@ internal static class IcsLineFolder
             {
                 spans.Add((start, end));
             }
+
+            i = end - 1;
         }
 
         return spans;
