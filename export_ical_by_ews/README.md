@@ -21,16 +21,16 @@
 
 | Параметр | Описание | Пример |
 |----------|----------|--------|
-| `audiscovery_url` | URL службы Autodiscover. Оставить пустым для использования `ews_url` | `https://autodiscover.example.com/autodiscover/autodiscover.xml` |
+| `audiscovery_url` (или `autodiscover_url`) | URL службы Autodiscover. Оставить пустым для использования `ews_url` | `https://autodiscover.example.com/autodiscover/autodiscover.xml` |
 | `ews_url` | Прямой URL Exchange Web Services (используется если Autodiscover недоступен) | `https://mail.example.com/EWS/Exchange.asmx` |
 | `input_file` | Путь к файлу со списком почтовых ящиков | `input_mailboxes.txt` |
 | `output_dir` | Каталог для сохранения ICS-файлов (создаётся автоматически) | `output` |
 | `superadmin` | Email учётной записи с правами доступа к ящикам | `admin@example.com` |
 | `superadmin_pass` | Пароль учётной записи | `P@ssw0rd!` |
-| `days_ago` | За сколько дней назад выгружать события. Для будущих дат выгружаются все события | `30` |
+| `days_ago` | За сколько дней назад выгружать события (по умолчанию `30`). Для будущих дат выгружаются события на год вперёд | `30` |
 | `file_max_size` | Максимальный размер одного ICS-файла в мегабайтах | `10` |
 | `allow_untrusted_connections` | Разрешить подключения к серверам с недоверенными SSL-сертификатами (`true`/`false`) | `true` |
-| `exchange_timezone_shift` | Смещение часового пояса Exchange относительно UTC | `+3` или `-5` |
+| `exchange_timezone_shift` | Смещение часового пояса Exchange относительно UTC (поддерживаются и смещения с минутами) | `+3`, `-5` или `+5:30` |
 
 >[!WARNING]
 > При импорте ICS файлов в Яндекс 360 размер каждого файла не должен превышать 10 Мб

@@ -9,8 +9,9 @@ import re
 import sys
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from http import HTTPStatus
 from typing import Optional, TextIO
 from urllib.parse import urljoin, quote, unquote, urlparse
@@ -25,11 +26,26 @@ from requests.auth import HTTPBasicAuth
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Отключаем проверку SSL глобально (корпоративный прокси с самоподписанным сертификатом)
+DEFAULT_HTTP_TIMEOUT_SEC = 60
+
+
+def _ssl_verify_enabled() -> bool:
+    # По умолчанию проверка SSL отключена (корпоративный прокси с самоподписанным сертификатом).
+    # Включается параметром SSL_VERIFY=true в .env.
+    return os.environ.get("SSL_VERIFY", "false").lower() == "true"
+
+
+# Глобальные умолчания для всех запросов requests: verify (см. выше) и таймаут —
+# без таймаута зависший сервер блокирует поток навсегда.
 _orig_session_request = requests.Session.request
+
+
 def _patched_session_request(self, method, url, **kwargs):
-    kwargs.setdefault("verify", False)
+    kwargs.setdefault("verify", _ssl_verify_enabled())
+    kwargs.setdefault("timeout", DEFAULT_HTTP_TIMEOUT_SEC)
     return _orig_session_request(self, method, url, **kwargs)
+
+
 requests.Session.request = _patched_session_request
 
 DEFAULT_360_API_URL = "https://api360.yandex.net"
@@ -49,6 +65,9 @@ DEFAULT_THREADS = 4
 ALL_USERS_REFRESH_IN_MINUTES = 15
 RPS_LIMIT = 100
 _last_call_caldav = 0.0
+_rate_limit_lock = threading.Lock()
+_users_cache_lock = threading.Lock()
+_domains_cache_lock = threading.Lock()
 
 # Маппинг Windows-имён часовых зон (Exchange) → IANA (Яндекс CalDAV).
 # Яндекс CalDAV может отклонять с 400 нестандартные TZID, особенно
@@ -413,24 +432,24 @@ def read_external_caldav_users_csv(path: str) -> list[dict]:
         return []
 
     data_list = []
+    header_skipped = False
     with open(path, newline="", encoding="utf-8-sig") as f:
         # Обработка строк вручную, чтобы поддерживать комментарии
-        for line in f:
-            line = line.strip()
+        for line_num, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
             if not line or line.startswith('#'):
                 continue
-            if not hasattr(read_external_caldav_users_csv, "_header_read"):
-                # первая строка - всегда заголовок, пропустить
-                read_external_caldav_users_csv._header_read = True
+            if not header_skipped:
+                # первая значимая строка - всегда заголовок, пропустить
+                header_skipped = True
                 continue
-            parts = line.split(";")
+            # maxsplit=2: пароль может содержать ';'
+            parts = line.split(";", 2)
             if len(parts) != 3:
-                continue  # пропускаем некорректные строки
+                logger.warning(f"External CalDAV users: строка {line_num} пропущена (ожидается alias;login;password)")
+                continue
             alias, login, password = (p.strip() for p in parts)
             data_list.append({"alias": alias, "login": login, "password": password})
-    # Очистим маркер для повторных вызовов
-    if hasattr(read_external_caldav_users_csv, "_header_read"):
-        del read_external_caldav_users_csv._header_read
     return data_list
 
 
@@ -438,16 +457,19 @@ def get_all_api360_users(settings: "SettingParams", force: bool = False) -> list
     if not force:
         logger.info("Getting all users of the organisation from cache...")
 
-    if (
-        not settings.all_users
-        or force
-        or (datetime.now() - settings.all_users_get_timestamp).total_seconds()
-        > ALL_USERS_REFRESH_IN_MINUTES * 60
-    ):
-        logger.info("Getting all users of the organisation from API...")
-        settings.all_users = get_all_api360_users_from_api(settings)
-        settings.all_users_get_timestamp = datetime.now()
-    return settings.all_users
+    # Блокировка: при параллельном импорте потоки одновременно видели устаревший кэш
+    # и каждый заново выгружал весь список пользователей из API.
+    with _users_cache_lock:
+        if (
+            not settings.all_users
+            or force
+            or (datetime.now() - settings.all_users_get_timestamp).total_seconds()
+            > ALL_USERS_REFRESH_IN_MINUTES * 60
+        ):
+            logger.info("Getting all users of the organisation from API...")
+            settings.all_users = get_all_api360_users_from_api(settings)
+            settings.all_users_get_timestamp = datetime.now()
+        return settings.all_users
 
 
 def get_all_api360_users_from_api(settings: "SettingParams") -> list[dict]:
@@ -491,16 +513,17 @@ def get_all_api360_domains(settings: "SettingParams", force: bool = False) -> li
     if not force:
         logger.info("Getting all domains of the organisation from cache...")
 
-    if (
-        not settings.all_domains
-        or force
-        or (datetime.now() - settings.all_domains_get_timestamp).total_seconds()
-        > ALL_USERS_REFRESH_IN_MINUTES * 60
-    ):
-        logger.info("Getting all domains of the organisation from API...")
-        settings.all_domains = get_all_api360_domains_from_api(settings)
-        settings.all_domains_get_timestamp = datetime.now()
-    return settings.all_domains
+    with _domains_cache_lock:
+        if (
+            not settings.all_domains
+            or force
+            or (datetime.now() - settings.all_domains_get_timestamp).total_seconds()
+            > ALL_USERS_REFRESH_IN_MINUTES * 60
+        ):
+            logger.info("Getting all domains of the organisation from API...")
+            settings.all_domains = get_all_api360_domains_from_api(settings)
+            settings.all_domains_get_timestamp = datetime.now()
+        return settings.all_domains
 
 
 def get_all_api360_domains_from_api(settings: "SettingParams") -> list[dict]:
@@ -540,14 +563,16 @@ def get_all_api360_domains_from_api(settings: "SettingParams") -> list[dict]:
 
     return domains
 
-def get_all_users_unique_aliases(settings: "SettingParams") -> list[str]:
+def get_all_users_unique_aliases(settings: "SettingParams") -> set[str]:
+    # set, а не list: используется для проверки вхождения на каждое импортируемое событие
     users = get_all_api360_users(settings)
     unique_aliases = set()
     for user in users:
         unique_aliases.add(user.get("nickname", "").lower())
         for alias in user.get("aliases", []):
             unique_aliases.add(alias.lower())
-    return list(unique_aliases)
+    unique_aliases.discard("")
+    return unique_aliases
 
 def find_users_prompt(
     settings: "SettingParams", answer: str = ""
@@ -652,16 +677,17 @@ def get_external_caldav_users_prompt(
             logger.error(f"Не найдены пользователи для обработки в файле {settings.external_caldav_users_file}.")
         return users_to_add, break_flag
 
-    one_user = answer.strip().split(":")
-    if len(one_user) != 2:
+    # maxsplit=1: пароль может содержать ':'
+    one_user = answer.strip().split(":", 1)
+    if len(one_user) != 2 or not one_user[0] or not one_user[1]:
         logger.error("Неверный формат данных о подключении. Используйте формат <CALDAV_login>:<CALDAV_password>.")
         return users_to_add, break_flag
 
     # Заменяем потенциальные спецсимволы (/, \, @) в логине на подчёркивание
     login_clean = re.sub(r'[\\/ @]', '_', one_user[0])
     users_to_add.append({"alias": login_clean, "login": one_user[0], "password": one_user[1]})
-      
-    return users_to_add, break_flag, 
+
+    return users_to_add, break_flag
 
 
 def parse_date_input(value: str) -> Optional[datetime]:
@@ -707,19 +733,39 @@ def build_thread_prefix(thread_id: int) -> str:
 
 
 def rate_limit_caldav_commands() -> None:
+    """Глобальный лимит RPS для CalDAV-запросов из всех потоков.
+
+    Раньше функция не была потокобезопасной: несколько потоков одновременно читали
+    одно и то же время последнего вызова и лимит фактически не соблюдался.
+    Теперь каждый вызов под блокировкой резервирует свой слот, а спит вне её.
+    """
     global _last_call_caldav
-    now = time.time()
-    delta = now - _last_call_caldav
     min_interval = 1.0 / RPS_LIMIT
-    if delta < min_interval:
-        time.sleep(min_interval - delta)
-    _last_call_caldav = time.time()
+    with _rate_limit_lock:
+        now = time.monotonic()
+        slot = max(now, _last_call_caldav + min_interval)
+        _last_call_caldav = slot
+    delay = slot - now
+    if delay > 0:
+        time.sleep(delay)
+
+
+# Разбиение только по CR/LF: str.splitlines() режет ещё и по \x0b, \x0c, \x1c-\x1e,
+# \x85,  ,  , которые встречаются внутри текстов событий (Outlook)
+# и раньше разрывали свойство на несколько «строк».
+_ICAL_LINE_SPLIT_RE = re.compile(r"\r\n|\n|\r")
+
+
+def _split_ical_lines(text: str) -> list[str]:
+    lines = _ICAL_LINE_SPLIT_RE.split(text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
 
 
 def _unfold_ical_lines(text: str) -> list[str]:
-    lines = text.splitlines()
     unfolded: list[str] = []
-    for line in lines:
+    for line in _split_ical_lines(text):
         if line.startswith((" ", "\t")) and unfolded:
             unfolded[-1] += line[1:]
         else:
@@ -738,7 +784,7 @@ def _fold_ical_lines(text: str, max_octets: int = 75) -> str:
     the leading space) never exceeds *max_octets*.
     """
     result: list[str] = []
-    for line in text.splitlines():
+    for line in _split_ical_lines(text):
         encoded = line.encode("utf-8")
         if len(encoded) <= max_octets:
             result.append(line)
@@ -826,7 +872,7 @@ def _collect_referenced_tzids(vevent_texts: list[str]) -> set[str]:
     for ev in vevent_texts:
         for line in _unfold_ical_lines(ev):
             for m in tzid_re.finditer(line):
-                tzids.add(m.group(1).strip())
+                tzids.add(m.group(1).strip().strip('"'))
     return tzids
 
 
@@ -897,11 +943,22 @@ def _normalize_tzids_in_text(text: str, tzid_map: dict[str, str]) -> str:
       - TZID:<old> в VTIMEZONE
     """
     for old_tzid, new_tzid in tzid_map.items():
-        # TZID=... (в параметрах свойств) — с учётом возможных кавычек
-        text = text.replace(f"TZID={old_tzid}", f"TZID={new_tzid}")
-        text = text.replace(f'TZID="{old_tzid}"', f"TZID={new_tzid}")
-        # TZID:... (определение в VTIMEZONE)
-        text = text.replace(f"TZID:{old_tzid}", f"TZID:{new_tzid}")
+        old_re = re.escape(old_tzid)
+        # TZID=... (в параметрах свойств) — с учётом возможных кавычек.
+        # Значение должно заканчиваться на ':' или ';' — иначе простая замена подстроки
+        # портила TZID с общим префиксом (например, "Russia Time Zone 1" и "... 10").
+        text = re.sub(
+            rf'TZID=(?:"{old_re}"|{old_re})(?=[;:])',
+            lambda _m, v=new_tzid: f"TZID={v}",
+            text,
+        )
+        # TZID:... (определение в VTIMEZONE) — значение до конца строки
+        text = re.sub(
+            rf"^TZID:{old_re}[ \t]*(?=\r?$)",
+            lambda _m, v=new_tzid: f"TZID:{v}",
+            text,
+            flags=re.MULTILINE,
+        )
     return text
 
 
@@ -1051,6 +1108,49 @@ def _group_events_by_uid(events: list[str]) -> dict[str, list[str]]:
     return {uid: groups[uid] for uid in order}
 
 
+def _recurrence_id_value(vevent_text: str) -> str:
+    for line in _unfold_ical_lines(vevent_text):
+        if _get_ical_tag_name(line) == "recurrence-id" and ":" in line:
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _group_layer_events(
+    layer_events: list[tuple[str, str]],
+) -> tuple[dict[str, list[str]], dict[str, str], int]:
+    """Группирует события слоя (из всех его файлов) по UID.
+
+    Args:
+        layer_events: список (путь_к_файлу, VEVENT).
+
+    Returns:
+        (группы UID -> VEVENT-ы с мастером первым,
+         UID -> файл, в котором группа встретилась впервые (для отчёта),
+         количество отброшенных дубликатов).
+
+    Дубликаты (тот же UID и тот же RECURRENCE-ID, например повторная выгрузка того же
+    календаря) отбрасываются: два мастера с одним UID в одном PUT сервер отвергает.
+    """
+    unique_events: list[str] = []
+    event_files: dict[int, str] = {}
+    seen: set[tuple[str, str]] = set()
+    duplicates = 0
+    for file_path, ev in layer_events:
+        uid = _extract_uid_from_event(ev)
+        if uid:
+            key = (uid, _recurrence_id_value(ev))
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+        event_files[id(ev)] = file_path
+        unique_events.append(ev)
+
+    groups = _group_events_by_uid(unique_events)
+    group_files = {uid: event_files[id(evs[0])] for uid, evs in groups.items()}
+    return groups, group_files, duplicates
+
+
 def _replace_uid_in_event(vevent_text: str, new_uid: str) -> str:
     lines = _unfold_ical_lines(vevent_text)
     updated = []
@@ -1066,36 +1166,36 @@ def _replace_uid_in_event(vevent_text: str, new_uid: str) -> str:
     return "\n".join(updated)
 
 
-def _extract_dtstart(vevent_text: str) -> Optional[datetime]:
-    for line in _unfold_ical_lines(vevent_text):
-        if not line.upper().startswith("DTSTART"):
-            continue
-        if ":" not in line:
-            continue
-        value = line.split(":", 1)[1].strip()
+def _parse_ical_datetime_value(value: str) -> Optional[datetime]:
+    """Разбирает значение DATE / DATE-TIME. При некорректном значении возвращает None
+    (раньше ValueError из strptime ронял поток импорта/выгрузки целиком)."""
+    value = value.strip()
+    try:
         if len(value) == 8:
             return datetime.strptime(value, "%Y%m%d")
         if value.endswith("Z"):
             return datetime.strptime(value, "%Y%m%dT%H%M%SZ")
         if len(value) >= 15:
             return datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        logger.debug(f"Не удалось разобрать дату iCal: '{value}'")
     return None
+
+
+def _extract_datetime_property(vevent_text: str, prop_name: str) -> Optional[datetime]:
+    for line in _unfold_ical_lines(vevent_text):
+        if _get_ical_tag_name(line) != prop_name or ":" not in line:
+            continue
+        return _parse_ical_datetime_value(line.split(":", 1)[1])
+    return None
+
+
+def _extract_dtstart(vevent_text: str) -> Optional[datetime]:
+    return _extract_datetime_property(vevent_text, "dtstart")
 
 
 def _extract_dtend(vevent_text: str) -> Optional[datetime]:
-    for line in _unfold_ical_lines(vevent_text):
-        if not line.upper().startswith("DTEND"):
-            continue
-        if ":" not in line:
-            continue
-        value = line.split(":", 1)[1].strip()
-        if len(value) == 8:
-            return datetime.strptime(value, "%Y%m%d")
-        if value.endswith("Z"):
-            return datetime.strptime(value, "%Y%m%dT%H%M%SZ")
-        if len(value) >= 15:
-            return datetime.strptime(value[:15], "%Y%m%dT%H%M%S")
-    return None
+    return _extract_datetime_property(vevent_text, "dtend")
 
 
 def _extract_summary(vevent_text: str) -> str:
@@ -1240,7 +1340,8 @@ def load_modify_rules(settings: "SettingParams") -> list[tuple[str, str, str, st
         line_text = line_text.strip()
         if not line_text or line_text.startswith("#"):
             continue
-        parts = line_text.split(";")
+        # maxsplit=3: value2 (строка замены regex) может содержать ';'
+        parts = line_text.split(";", 3)
         if len(parts) < 3:
             logger.warning(f"Invalid modify rule (not enough fields): {line_text}")
             continue
@@ -1455,17 +1556,9 @@ def modify_ics_content(
     if not replace_rules and not delete_rules and not add_rules:
         return ics_text, changes
 
-    lines = ics_text.splitlines()
-
     # Unfold RFC 5545 continuation lines (lines starting with space/tab
     # are continuations of the previous line and must be joined)
-    unfolded: list[str] = []
-    for line in lines:
-        if line.startswith((" ", "\t")) and unfolded:
-            unfolded[-1] += line[1:]
-        else:
-            unfolded.append(line)
-    lines = unfolded
+    lines = _unfold_ical_lines(ics_text)
 
     # Split ICS into segments: non-VEVENT lines and individual VEVENT blocks
     segments: list[tuple[str, list[str]]] = []
@@ -1579,6 +1672,15 @@ def build_caldav_session(user_email: str, token: str) -> requests.Session:
     return session
 
 
+def _refresh_caldav_session(
+    session: requests.Session, settings: "SettingParams", user_email: str
+) -> requests.Session:
+    """Перевыпускает токен сервисного приложения после 401 и закрывает старую сессию."""
+    token = get_service_app_token(settings, user_email)
+    session.close()
+    return build_caldav_session(user_email, token)
+
+
 def _caldav_propfind(session: requests.Session, url: str, body: str, depth: str = "0") -> requests.Response:
     headers = {"Depth": depth, "Content-Type": "application/xml; charset=utf-8"}
     rate_limit_caldav_commands()
@@ -1603,48 +1705,88 @@ def _caldav_propfind(session: requests.Session, url: str, body: str, depth: str 
     return response
 
 
-def _extract_href_from_xml(xml_text: str) -> Optional[str]:
-    """Extract href value from XML, handling both D:href and href with xmlns."""
-    # Try D:href first
-    match = re.search(r"<D:href>([^<]+)</D:href>", xml_text)
-    if match:
-        return match.group(1)
-    # Try href with xmlns attribute
-    match = re.search(r'<href[^>]*>([^<]+)</href>', xml_text)
-    if match:
-        return match.group(1)
-    return None
+DAV_NS = "{DAV:}"
+CALDAV_NS = "{urn:ietf:params:xml:ns:caldav}"
+_HTTP_STATUS_RE = re.compile(r"\s(\d{3})(?:\s|$)")
 
 
-def _extract_status_code(xml_text: str) -> Optional[str]:
-    """Extract HTTP status code from propstat status element."""
-    # Handle both <D:status> and <status xmlns="DAV:">
-    match = re.search(r'<(?:D:)?status[^>]*>HTTP/1\.\d\s+(\d+)', xml_text)
-    if match:
-        return match.group(1)
-    match = re.search(r'<status[^>]*>HTTP/1\.\d\s+(\d+)', xml_text)
-    if match:
-        return match.group(1)
-    return None
+def _xml_local_name(tag) -> str:
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
 
 
-def _split_responses(xml_text: str) -> list[str]:
-    """Split multistatus XML into individual response blocks."""
-    responses = []
-    # Match <D:response>...</D:response> blocks
-    for match in re.finditer(r'<D:response>(.*?)</D:response>', xml_text, re.DOTALL):
-        responses.append(match.group(1))
-    return responses
+def _parse_xml(content) -> Optional[ET.Element]:
+    """Разбирает XML-ответ CalDAV-сервера.
+
+    Раньше ответы разбирались регулярными выражениями по литеральным префиксам
+    <D:response>, <D:href>, <C:calendar-data>. Серверы, использующие другие префиксы
+    (d:, cal:, пространство имён по умолчанию), возвращали «пустой» результат,
+    а XML-сущности (&amp;, &lt;, &#13;) не декодировались и попадали в выгружаемые .ics.
+    """
+    if not content:
+        return None
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError as exc:
+        logger.error(f"Не удалось разобрать XML-ответ CalDAV: {exc}")
+        return None
 
 
-def _split_propstats(response_text: str) -> list[tuple[str, str]]:
-    """Split response into propstat blocks with their status codes."""
-    propstats = []
-    for match in re.finditer(r'<D:propstat>(.*?)</D:propstat>', response_text, re.DOTALL):
-        content = match.group(1)
-        status = _extract_status_code(content)
-        propstats.append((content, status or ""))
-    return propstats
+def _status_code(status_text: Optional[str]) -> str:
+    """'HTTP/1.1 200 OK' -> '200'."""
+    if not status_text:
+        return ""
+    match = _HTTP_STATUS_RE.search(" " + status_text.strip())
+    return match.group(1) if match else ""
+
+
+def _parse_multistatus(content) -> list[dict]:
+    """Разбирает DAV:multistatus.
+
+    Возвращает список {"href": str, "status": str, "props": {local_name: Element}},
+    где props содержит только свойства из propstat со статусом 200 (или без статуса).
+    """
+    root = _parse_xml(content)
+    if root is None:
+        return []
+    items = []
+    for resp in root.iter(f"{DAV_NS}response"):
+        href_el = resp.find(f"{DAV_NS}href")
+        href = (href_el.text or "").strip() if href_el is not None else ""
+        props: dict[str, ET.Element] = {}
+        for propstat in resp.findall(f"{DAV_NS}propstat"):
+            code = _status_code(propstat.findtext(f"{DAV_NS}status"))
+            if code and code != "200":
+                continue
+            prop_el = propstat.find(f"{DAV_NS}prop")
+            if prop_el is None:
+                continue
+            for prop in prop_el:
+                props.setdefault(_xml_local_name(prop.tag), prop)
+        items.append({
+            "href": href,
+            "status": _status_code(resp.findtext(f"{DAV_NS}status")),
+            "props": props,
+        })
+    return items
+
+
+def _prop_text(props: dict, name: str) -> Optional[str]:
+    element = props.get(name)
+    if element is None:
+        return None
+    return (element.text or "").strip()
+
+
+def _find_nested_href(content, container_tag: str) -> Optional[str]:
+    root = _parse_xml(content)
+    if root is None:
+        return None
+    href_el = root.find(f".//{container_tag}/{DAV_NS}href")
+    if href_el is None or not (href_el.text or "").strip():
+        return None
+    return href_el.text.strip()
 
 
 def discover_calendar_home(user_email: str, session: requests.Session, external_caldav_url: Optional[str] = None) -> Optional[str]:
@@ -1655,12 +1797,9 @@ def discover_calendar_home(user_email: str, session: requests.Session, external_
   </D:prop>
 </D:propfind>"""
 
-    if external_caldav_url:
-        BASE_URL = external_caldav_url
-    else:
-        BASE_URL = CALDAV_BASE_URL
+    base_url = (external_caldav_url or CALDAV_BASE_URL).rstrip("/")
 
-    root_candidates = [f"{BASE_URL}/", f"{BASE_URL}/.well-known/caldav"]
+    root_candidates = [f"{base_url}/", f"{base_url}/.well-known/caldav"]
     principal_url = None
     for root_url in root_candidates:
         response = _caldav_propfind(session, root_url, propfind_root)
@@ -1669,20 +1808,13 @@ def discover_calendar_home(user_email: str, session: requests.Session, external_
                 f"Failed to PROPFIND caldav root {root_url}: {response.status_code} {response.text}"
             )
             continue
-        # Look for current-user-principal containing href
-        principal_match = re.search(
-            r"<D:current-user-principal>(.*?)</D:current-user-principal>",
-            response.text,
-            re.DOTALL,
-        )
-        if principal_match:
-            href = _extract_href_from_xml(principal_match.group(1))
-            if href:
-                principal_url = urljoin(BASE_URL + "/", href)
-                break
+        href = _find_nested_href(response.content, f"{DAV_NS}current-user-principal")
+        if href:
+            principal_url = urljoin(base_url + "/", href)
+            break
     if not principal_url:
         encoded_email = quote(user_email.strip().lower())
-        principal_url = f"{BASE_URL}/principals/users/{encoded_email}/"
+        principal_url = f"{base_url}/principals/users/{encoded_email}/"
 
     propfind_principal = """<?xml version='1.0'?>
 <D:propfind xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
@@ -1694,20 +1826,11 @@ def discover_calendar_home(user_email: str, session: requests.Session, external_
     if response.status_code not in (200, 207):
         logger.error(f"Failed to PROPFIND principal: {response.status_code} {response.text}")
         return None
-    # Look for calendar-home-set containing href
-    home_match = re.search(
-        r"<C:calendar-home-set[^>]*>(.*?)</C:calendar-home-set>",
-        response.text,
-        re.DOTALL,
-    )
-    if not home_match:
-        logger.error(f"calendar-home-set not found in response for {principal_url}")
-        return None
-    href = _extract_href_from_xml(home_match.group(1))
+    href = _find_nested_href(response.content, f"{CALDAV_NS}calendar-home-set")
     if not href:
-        logger.error(f"href not found inside calendar-home-set for {principal_url}")
+        logger.error(f"calendar-home-set href not found in response for {principal_url}")
         return None
-    return urljoin(BASE_URL + "/", href)
+    return urljoin(base_url + "/", href)
 
 
 def discover_calendars(calendar_home_url: str, session: requests.Session) -> list[dict]:
@@ -1733,15 +1856,12 @@ def discover_calendars(calendar_home_url: str, session: requests.Session) -> lis
         decoded_email = unquote(encoded_email)
         if "@" in decoded_email:
             local, domain = decoded_email.split("@", 1)
-            alt_domains = []
             if domain.startswith("360."):
-                alt_domains.append(domain[len("360.") :])
+                alt_domain = domain[len("360."):]
             else:
-                alt_domains.append(f"360.{domain}")
-            for alt_domain in alt_domains:
-                alt_email = f"{local}@{alt_domain}"
-                alt_encoded = quote(alt_email)
-                candidates.append(calendar_home_url.replace(encoded_email, alt_encoded))
+                alt_domain = f"360.{domain}"
+            alt_encoded = quote(f"{local}@{alt_domain}")
+            candidates.append(calendar_home_url.replace(encoded_email, alt_encoded))
 
     response = None
     seen = set()
@@ -1761,13 +1881,12 @@ def discover_calendars(calendar_home_url: str, session: requests.Session) -> lis
             f"PROPFIND {candidate_url} failed: {response.status_code} {response.text}"
         )
 
-    if not response or response.status_code not in (200, 207):
+    if response is None or response.status_code not in (200, 207):
         return []
 
     calendars = []
-    for resp_content in _split_responses(response.text):
-        # Extract href (may be <href xmlns="DAV:"> or <D:href>)
-        href_value = _extract_href_from_xml(resp_content)
+    for item in _parse_multistatus(response.content):
+        href_value = item["href"]
         if not href_value:
             continue
         # Skip inbox/outbox/notifications
@@ -1776,64 +1895,39 @@ def discover_calendars(calendar_home_url: str, session: requests.Session) -> lis
             for part in ("/inbox/", "/outbox/", "/notifications/")
         ):
             continue
-        
-        # Collect successful propstat blocks (status 200)
-        propstat_ok_content = []
-        for propstat_content, status in _split_propstats(resp_content):
-            if status == "200":
-                propstat_ok_content.append(propstat_content)
-        
-        prop_block = "\n".join(propstat_ok_content) if propstat_ok_content else resp_content
-        
-        # Check resourcetype for calendar - look for C:calendar or calendar tag
-        resourcetype_match = re.search(
-            r"<D:resourcetype>(.*?)</D:resourcetype>", prop_block, re.DOTALL
+
+        props = item["props"]
+
+        resourcetype = props.get("resourcetype")
+        resource_names = (
+            {_xml_local_name(child.tag).lower() for child in resourcetype}
+            if resourcetype is not None else set()
         )
-        resourcetype_text = resourcetype_match.group(1) if resourcetype_match else ""
-        
-        # Check if it's a calendar (C:calendar or just "calendar" in resourcetype)
-        is_calendar = bool(re.search(r'<(?:C:)?calendar[^>]*/?>|calendar', resourcetype_text, re.IGNORECASE))
-        
-        # Get displayname
-        displayname_match = re.search(
-            r"<D:displayname>([^<]*)</D:displayname>", prop_block
-        )
-        displayname = displayname_match.group(1) if displayname_match else "Unknown"
-        
-        # Get calendar color (may have xmlns attribute)
-        color_match = re.search(r'<(?:E:)?calendar-color[^>]*>([^<]*)</(?:E:)?calendar-color>', prop_block)
-        if not color_match:
-            color_match = re.search(r'<calendar-color[^>]*>([^<]*)</calendar-color>', prop_block)
-        calendar_color = color_match.group(1) if color_match else None
-        
-        # Get ctag (may have xmlns attribute)
-        ctag_match = re.search(r'<(?:CS:)?getctag[^>]*>([^<]*)</(?:CS:)?getctag>', prop_block)
-        if not ctag_match:
-            ctag_match = re.search(r'<getctag[^>]*>([^<]*)</getctag>', prop_block)
-        calendar_ctag = ctag_match.group(1) if ctag_match else None
-        
-        # Get supported component set (C:comp with name attribute)
-        supports = re.findall(
-            r'<(?:C:)?comp[^>]+name="([A-Za-z]+)"',
-            prop_block,
-        )
-        supports = [item.upper() for item in supports]
-        
+        is_calendar = "calendar" in resource_names
+
+        component_set = props.get("supported-calendar-component-set")
+        supports = []
+        if component_set is not None:
+            supports = [
+                (comp.get("name") or "").upper()
+                for comp in component_set
+                if _xml_local_name(comp.tag) == "comp" and comp.get("name")
+            ]
+
         # If has supported components (VEVENT/VTODO), it's a calendar
         if not is_calendar and {"VEVENT", "VTODO", "VJOURNAL"} & set(supports):
             is_calendar = True
-        
+
         if not is_calendar:
             continue
-        
-        calendar_url = urljoin(calendar_home_url, href_value)
+
         calendars.append(
             {
-                "url": calendar_url,
-                "name": displayname,
+                "url": urljoin(calendar_home_url, href_value),
+                "name": _prop_text(props, "displayname") or "Unknown",
                 "components": supports,
-                "color": calendar_color,
-                "ctag": calendar_ctag,
+                "color": _prop_text(props, "calendar-color"),
+                "ctag": _prop_text(props, "getctag"),
             }
         )
     return calendars
@@ -1873,6 +1967,26 @@ def pick_default_personal_calendar(calendars: list[dict]) -> Optional[dict]:
     return calendars[0] if calendars else None
 
 
+def _to_caldav_utc(value: datetime) -> str:
+    """Наивная дата из ввода пользователя — локальное время; CalDAV time-range ждёт UTC.
+
+    Раньше локальное время просто помечалось суффиксом Z, и диапазон смещался
+    на величину часового пояса.
+    """
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _event_href_name(uid: str) -> str:
+    """Имя ресурса события в календаре: <uid>.ics с экранированием спецсимволов.
+
+    Без экранирования UID вида "urn:uuid:..." превращался в urljoin() в абсолютный URL
+    другой схемы, а '/', '?', '#', пробелы ломали путь.
+    """
+    return f"{quote(uid, safe='@-._~')}.ics"
+
+
 def caldav_calendar_query(
     calendar_url: str,
     session: requests.Session,
@@ -1881,8 +1995,8 @@ def caldav_calendar_query(
     settings: Optional["SettingParams"] = None,
     user_email: Optional[str] = None,
 ) -> tuple[list[dict], requests.Session]:
-    start_utc = start.strftime("%Y%m%dT%H%M%SZ") if start else ""
-    end_utc = end.strftime("%Y%m%dT%H%M%SZ") if end else ""
+    start_utc = _to_caldav_utc(start) if start else ""
+    end_utc = _to_caldav_utc(end) if end else ""
     if start_utc and end_utc:
         time_range = f'<C:time-range start="{start_utc}" end="{end_utc}"/>'
     elif start_utc:
@@ -1934,15 +2048,13 @@ def caldav_calendar_query(
 
         if response.status_code in (200, 207):
             results = []
-            for resp_content in _split_responses(response.text):
-                href_value = _extract_href_from_xml(resp_content)
-                if not href_value:
+            for item in _parse_multistatus(response.content):
+                if not item["href"]:
                     continue
-                etag_match = re.search(r"<D:getetag>([^<]+)</D:getetag>", resp_content)
                 results.append(
                     {
-                        "href": href_value,
-                        "etag": etag_match.group(1) if etag_match else None,
+                        "href": item["href"],
+                        "etag": _prop_text(item["props"], "getetag") or None,
                     }
                 )
             return results, session
@@ -1951,8 +2063,7 @@ def caldav_calendar_query(
             logger.warning(
                 f"CalDAV REPORT auth error 401 (attempt {attempt}/{MAX_RETRIES}), refreshing session for {user_email}"
             )
-            token = get_service_app_token(settings, user_email)
-            session = build_caldav_session(user_email, token)
+            session = _refresh_caldav_session(session, settings, user_email)
             continue
 
         logger.error(
@@ -1969,7 +2080,7 @@ def caldav_calendar_multiget(
 ) -> list[dict]:
     if not hrefs:
         return []
-    href_elements = "\n".join([f"<D:href>{href}</D:href>" for href in hrefs])
+    href_elements = "\n".join(f"<D:href>{html.escape(href, quote=False)}</D:href>" for href in hrefs)
     body = f"""<?xml version="1.0" encoding="utf-8"?>
 <C:calendar-multiget xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
   <D:prop>
@@ -1982,13 +2093,17 @@ def caldav_calendar_multiget(
     headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
     if is_verbose_logging_enabled():
         logger.debug(f"CalDAV request url={calendar_url} headers={headers} body={body}")
-    response = session.request(
-        "REPORT",
-        calendar_url,
-        headers=headers,
-        data=body,
-        timeout=60,
-    )
+    try:
+        response = session.request(
+            "REPORT",
+            calendar_url,
+            headers=headers,
+            data=body.encode("utf-8"),
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Calendar multiget request error: {exc}")
+        return []
     if is_verbose_logging_enabled():
         response_text = response.content.decode("utf-8", errors="replace")
         logger.debug(
@@ -1999,24 +2114,19 @@ def caldav_calendar_multiget(
         return []
 
     results = []
-    for resp_content in _split_responses(response.text):
-        href_value = _extract_href_from_xml(resp_content)
-        if not href_value:
+    for item in _parse_multistatus(response.content):
+        if not item["href"]:
             continue
-        # Extract etag
-        etag_match = re.search(r"<D:getetag>([^<]+)</D:getetag>", resp_content)
-        # Extract calendar-data
-        data_match = re.search(r"<C:calendar-data[^>]*>(.*?)</C:calendar-data>", resp_content, re.DOTALL)
-        if data_match:
-            calendar_data = data_match.group(1)
-            calendar_data = calendar_data.replace("\r\n", "\n")
-            results.append(
-                {
-                    "href": href_value,
-                    "etag": etag_match.group(1) if etag_match else None,
-                    "data": calendar_data,
-                }
-            )
+        calendar_data = _prop_text(item["props"], "calendar-data")
+        if not calendar_data:
+            continue
+        results.append(
+            {
+                "href": item["href"],
+                "etag": _prop_text(item["props"], "getetag") or None,
+                "data": calendar_data.replace("\r\n", "\n").replace("\r", "\n"),
+            }
+        )
     return results
 
 
@@ -2024,27 +2134,29 @@ def caldav_find_event_by_uid(
     calendar_url: str, session: requests.Session, uid: str
 ) -> Optional[dict]:
     calendar_path = urlparse(calendar_url).path.rstrip("/")
-    href_path = f"{calendar_path}/{uid}.ics"
+    href_path = f"{calendar_path}/{_event_href_name(uid)}"
     multiget_query = f"""<?xml version="1.0"?>
 <C:calendar-multiget xmlns:C="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:">
     <D:prop>
         <D:getetag/>
-        <D:displayname/>
-        <C:calendar-data/>
     </D:prop>
-    <D:href>{href_path}</D:href>
+    <D:href>{html.escape(href_path, quote=False)}</D:href>
 </C:calendar-multiget>"""
     rate_limit_caldav_commands()
     headers = {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
     if is_verbose_logging_enabled():
         logger.debug(f"CalDAV request url={calendar_url} headers={headers} body={multiget_query}")
-    response = session.request(
-        "REPORT",
-        calendar_url,
-        headers=headers,
-        data=multiget_query,
-        timeout=60,
-    )
+    try:
+        response = session.request(
+            "REPORT",
+            calendar_url,
+            headers=headers,
+            data=multiget_query.encode("utf-8"),
+            timeout=60,
+        )
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"CalDAV lookup by UID failed for {uid}: {exc}")
+        return None
     if is_verbose_logging_enabled():
         response_text = response.content.decode("utf-8", errors="replace")
         logger.debug(
@@ -2052,17 +2164,10 @@ def caldav_find_event_by_uid(
         )
     if response.status_code not in (200, 207):
         return None
-    for resp_content in _split_responses(response.text):
-        href_value = _extract_href_from_xml(resp_content)
-        if href_value:
-            for propstat_content, status in _split_propstats(resp_content):
-                if "200" in status:
-                    etag_match = re.search(r"<D:getetag>([^<]+)</D:getetag>", propstat_content)
-                    if etag_match:
-                        return {
-                            "href": href_value,
-                            "etag": etag_match.group(1),
-                        }
+    for item in _parse_multistatus(response.content):
+        etag = _prop_text(item["props"], "getetag")
+        if item["href"] and etag and item["status"] in ("", "200"):
+            return {"href": item["href"], "etag": etag}
     return None
 
 
@@ -2118,8 +2223,7 @@ def caldav_put_event(
             logger.warning(
                 f"CalDAV PUT auth error 401 (attempt {attempt}/{MAX_RETRIES}), refreshing session for {user_email}"
             )
-            token = get_service_app_token(settings, user_email)
-            session = build_caldav_session(user_email, token)
+            session = _refresh_caldav_session(session, settings, user_email)
             continue
 
         logger.error(
@@ -2171,8 +2275,7 @@ def caldav_delete_event(
             logger.warning(
                 f"CalDAV DELETE auth error 401 (attempt {attempt}/{MAX_RETRIES}), refreshing session for {user_email}"
             )
-            token = get_service_app_token(settings, user_email)
-            session = build_caldav_session(user_email, token)
+            session = _refresh_caldav_session(session, settings, user_email)
             continue
 
         logger.error(
@@ -2469,10 +2572,30 @@ def filter_events_by_query(events: list[str], query: str) -> list[str]:
     return events
 
 
+_FILENAME_INVALID_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f~]')
+
+
+def _safe_file_component(value: str) -> str:
+    """Делает строку пригодной для имени файла. '~' тоже заменяется: это разделитель
+    user~layer~timestamp в именах выгружаемых файлов (см. parse_input_files)."""
+    cleaned = _FILENAME_INVALID_RE.sub("_", value).strip(" .")
+    return cleaned or "_"
+
+
+def _layer_file_name(calendar_name: str) -> str:
+    return _safe_file_component(calendar_name.replace(" ", "_"))
+
+
+def _write_ics_file(path: str, groups: list[list[str]], vtimezones: list[str]) -> None:
+    events = [ev for group in groups for ev in group]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(build_vcalendar(events, vtimezones))
+
+
 def export_events_for_user(
     settings: "SettingParams",
     user: dict,
-    start: datetime,
+    start: Optional[datetime],
     end: Optional[datetime],
     query_filter: str,
     thread_id: int = 0,
@@ -2488,6 +2611,8 @@ def export_events_for_user(
             logger.warning(f"{thread_prefix}Skipping user without email.")
             return 0
         token = get_service_app_token(settings, user_email)
+        # При 401 токен сервисного приложения можно перевыпустить
+        refresh_settings = settings
     else:
         # Если внешний сервер CalDAV указан, используем логин и пароль из файла или ручного ввода
         token = user.get("password")
@@ -2498,8 +2623,31 @@ def export_events_for_user(
         if not user_email:
             logger.warning(f"{thread_prefix}Skipping user without login.")
             return 0
+        # Для внешнего сервера 401 означает неверный пароль: перевыпуск токена Яндекса
+        # (как было раньше) здесь бессмыслен и заканчивался TokenError.
+        refresh_settings = None
     session = build_caldav_session(user_email, token)
+    try:
+        return _export_user_calendars(
+            settings, session, user, user_email, start, end, query_filter,
+            thread_prefix, external_caldav_url, refresh_settings,
+        )
+    finally:
+        session.close()
 
+
+def _export_user_calendars(
+    settings: "SettingParams",
+    session: requests.Session,
+    user: dict,
+    user_email: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+    query_filter: str,
+    thread_prefix: str,
+    external_caldav_url: Optional[str],
+    refresh_settings: Optional["SettingParams"],
+) -> int:
     calendar_home = discover_calendar_home(user_email, session, external_caldav_url)
     if not calendar_home:
         logger.error(f"{thread_prefix}No calendar home for {user_email}")
@@ -2529,6 +2677,8 @@ def export_events_for_user(
         nickname = user_email
     else:
         nickname = user.get("alias") or user_email.split("@")[0]
+    # Логин внешнего сервера может содержать '\' или '/' (DOMAIN\user)
+    nickname = _safe_file_component(nickname)
     timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
     max_bytes = settings.output_max_mb * 1024 * 1024
 
@@ -2536,7 +2686,10 @@ def export_events_for_user(
         is_default = default_calendar and calendar["url"] == default_calendar["url"]
 
         logger.info(f"{thread_prefix}Exporting from calendar '{calendar['name']}' for {user_email}")
-        hrefs, session = caldav_calendar_query(calendar["url"], session, start, end, settings=settings, user_email=user_email)
+        hrefs, session = caldav_calendar_query(
+            calendar["url"], session, start, end,
+            settings=refresh_settings, user_email=user_email,
+        )
         if not hrefs:
             logger.info(f"{thread_prefix}No events found in '{calendar['name']}' for {user_email}")
             continue
@@ -2560,45 +2713,40 @@ def export_events_for_user(
             logger.info(f"{thread_prefix}No events match query in '{calendar['name']}' for {user_email}")
             continue
 
-        unique_tz = []
-        seen: set[str] = set()
-        for tz in vtimezones:
-            if tz not in seen:
-                unique_tz.append(tz)
-                seen.add(tz)
+        unique_tz = list(dict.fromkeys(vtimezones))
 
-        layer_name = calendar["name"].replace(" ", "_")
+        layer_name = _layer_file_name(calendar["name"])
         if is_default:
             layer_name = f"{{{layer_name}}}"
         base_name = f"{nickname}~{layer_name}"
 
+        # Повторяющееся событие (мастер + исключения с RECURRENCE-ID) всегда пишется
+        # в один файл: раньше разбиение по размеру могло разнести их по разным файлам,
+        # и при импорте исключение уходило отдельным PUT (конфликт UID / потеря мастера).
+        groups = list(_group_events_by_uid(events_data).values())
+        tz_bytes = sum(len(tz.encode("utf-8")) + 1 for tz in unique_tz)
+
         files_created = 0
-        current_events: list[str] = []
-        current_size = 0
-        for idx, ev in enumerate(events_data, start=1):
-            ev_size = len(ev.encode("utf-8"))
-            if current_events and current_size + ev_size > max_bytes:
+        current_groups: list[list[str]] = []
+        current_size = tz_bytes
+        for group in groups:
+            group_size = sum(len(ev.encode("utf-8")) + 1 for ev in group)
+            if current_groups and current_size + group_size > max_bytes:
                 files_created += 1
                 file_name = f"{base_name}~{timestamp}_{files_created}.ics"
-                file_path = os.path.join(settings.output_dir, file_name)
-                content = build_vcalendar("\n".join(current_events), unique_tz)
-                with open(file_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-                current_events = []
-                current_size = 0
-            current_events.append(ev)
-            current_size += ev_size
+                _write_ics_file(os.path.join(settings.output_dir, file_name), current_groups, unique_tz)
+                current_groups = []
+                current_size = tz_bytes
+            current_groups.append(group)
+            current_size += group_size
 
-        if current_events:
+        if current_groups:
             files_created += 1
             if files_created == 1:
                 file_name = f"{base_name}~{timestamp}.ics"
             else:
                 file_name = f"{base_name}~{timestamp}_{files_created}.ics"
-            file_path = os.path.join(settings.output_dir, file_name)
-            content = build_vcalendar("\n".join(current_events), unique_tz)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_ics_file(os.path.join(settings.output_dir, file_name), current_groups, unique_tz)
 
         logger.info(f"{thread_prefix}Exported {len(events_data)} events into {files_created} files from '{calendar['name']}' for {user_email}")
         total_events += len(events_data)
@@ -2623,95 +2771,101 @@ def delete_events_for_user(
 
     token = get_service_app_token(settings, user_email)
     session = build_caldav_session(user_email, token)
+    try:
 
-    calendar_home = discover_calendar_home(user_email, session)
-    if not calendar_home:
-        logger.error(f"{thread_prefix}Не найден calendar home для {user_email}")
-        return 0
+        calendar_home = discover_calendar_home(user_email, session)
+        if not calendar_home:
+            logger.error(f"{thread_prefix}Не найден calendar home для {user_email}")
+            return 0
 
-    calendars = discover_calendars(calendar_home, session)
-    default_calendar = pick_default_personal_calendar(calendars)
-    if not default_calendar:
-        logger.warning(f"{thread_prefix}Не найден календарь по умолчанию для {user_email}")
-        return 0
+        calendars = discover_calendars(calendar_home, session)
+        default_calendar = pick_default_personal_calendar(calendars)
+        if not default_calendar:
+            logger.warning(f"{thread_prefix}Не найден календарь по умолчанию для {user_email}")
+            return 0
 
-    logger.info(f"{thread_prefix}Удаление событий из календаря '{default_calendar['name']}' для {user_email}")
+        logger.info(f"{thread_prefix}Удаление событий из календаря '{default_calendar['name']}' для {user_email}")
 
-    hrefs, session = caldav_calendar_query(
-        default_calendar["url"], session, start, end,
-        settings=settings, user_email=user_email,
-    )
-    if not hrefs:
-        logger.info(f"{thread_prefix}Нет событий для удаления в '{default_calendar['name']}' для {user_email}")
-        with report_lock:
-            report_writer.writerow([user_email, "", "", "", "", "no events found, skip"])
-        return 0
-
-    deleted_count = 0
-    batch_size = 50
-    for i in range(0, len(hrefs), batch_size):
-        chunk = hrefs[i : i + batch_size]
-        data_list = caldav_calendar_multiget(
-            default_calendar["url"], session, [item["href"] for item in chunk]
+        hrefs, session = caldav_calendar_query(
+            default_calendar["url"], session, start, end,
+            settings=settings, user_email=user_email,
         )
+        if not hrefs:
+            logger.info(f"{thread_prefix}Нет событий для удаления в '{default_calendar['name']}' для {user_email}")
+            with report_lock:
+                report_writer.writerow([user_email, "", "", "", "", "no events found, skip"])
+            return 0
 
-        href_data_map = {}
-        for item in data_list:
-            href_data_map[item["href"]] = item
-
-        for href_item in chunk:
-            href = href_item["href"]
-            etag = href_item.get("etag")
-
-            event_data = href_data_map.get(href, {})
-            raw_data = event_data.get("data", "")
-            vevent_blocks = _extract_vevent_blocks(raw_data)
-
-            event_uid = ""
-            summary = ""
-            start_date = ""
-            end_date = ""
-
-            if vevent_blocks:
-                first_vevent = vevent_blocks[0]
-                event_uid = _extract_uid_from_event(first_vevent) or ""
-                summary = _extract_summary(first_vevent)
-                dtstart = _extract_dtstart(first_vevent)
-                dtend = _extract_dtend(first_vevent)
-                start_date = dtstart.strftime("%Y-%m-%d %H:%M:%S") if dtstart else ""
-                end_date = dtend.strftime("%Y-%m-%d %H:%M:%S") if dtend else ""
-
-            success, session = caldav_delete_event(
-                session, default_calendar["url"], href,
-                etag=etag, settings=settings, user_email=user_email,
+        deleted_count = 0
+        batch_size = 50
+        for i in range(0, len(hrefs), batch_size):
+            chunk = hrefs[i : i + batch_size]
+            data_list = caldav_calendar_multiget(
+                default_calendar["url"], session, [item["href"] for item in chunk]
             )
 
-            status = "ok" if success else "error"
-            if success:
-                deleted_count += 1
+            href_data_map = {}
+            for item in data_list:
+                href_data_map[item["href"]] = item
 
-            with report_lock:
-                report_writer.writerow([user_email, event_uid, summary, start_date, end_date, status])
+            for href_item in chunk:
+                href = href_item["href"]
+                etag = href_item.get("etag")
 
-            logger.debug(f"{thread_prefix}Удаление события {event_uid} ({summary}): {status}")
+                event_data = href_data_map.get(href, {})
+                raw_data = event_data.get("data", "")
+                vevent_blocks = _extract_vevent_blocks(raw_data)
 
-        time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+                event_uid = ""
+                summary = ""
+                start_date = ""
+                end_date = ""
 
-    logger.info(f"{thread_prefix}Удалено {deleted_count} из {len(hrefs)} событий для {user_email}")
-    return deleted_count
+                if vevent_blocks:
+                    first_vevent = vevent_blocks[0]
+                    event_uid = _extract_uid_from_event(first_vevent) or ""
+                    summary = _extract_summary(first_vevent)
+                    dtstart = _extract_dtstart(first_vevent)
+                    dtend = _extract_dtend(first_vevent)
+                    start_date = dtstart.strftime("%Y-%m-%d %H:%M:%S") if dtstart else ""
+                    end_date = dtend.strftime("%Y-%m-%d %H:%M:%S") if dtend else ""
 
-def is_user_organizer(user: dict, organizer_email: str, unique_aliases: list[str], domain_names: list[str]) -> str:
+                success, session = caldav_delete_event(
+                    session, default_calendar["url"], href,
+                    etag=etag, settings=settings, user_email=user_email,
+                )
+
+                status = "ok" if success else "error"
+                if success:
+                    deleted_count += 1
+
+                with report_lock:
+                    report_writer.writerow([user_email, event_uid, summary, start_date, end_date, status])
+
+                logger.debug(f"{thread_prefix}Удаление события {event_uid} ({summary}): {status}")
+
+            time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
+
+        logger.info(f"{thread_prefix}Удалено {deleted_count} из {len(hrefs)} событий для {user_email}")
+        return deleted_count
+    finally:
+        session.close()
+
+def is_user_organizer(user: dict, organizer_email: str, unique_aliases: set[str], domain_names: set[str]) -> str:
     # Проверяем, кто является организатором события: пользователь из 360 или внешний организатор
     # Если организатор - пользователь, в календарь которого импортируется событие, то возвращаем "organizer"
     # Если организатор - пользователь из 360, то возвращаем "y360_organizer"
     # Если организатор - внешний организатор, то возвращаем "external_organizer"
     
 
-    user_aliases = [alias.lower() for alias in user.get("aliases", [])]
-    if not user_aliases:
-        user_aliases = [user.get("nickname", "").lower()]
-    else:
-        user_aliases.append(user.get("nickname", "").lower())
+    # Событие без ORGANIZER (личная встреча без участников) принадлежит владельцу
+    # календаря — раньше такие события считались «чужими» и пропускались.
+    if not organizer_email:
+        return "organizer"
+
+    user_aliases = {alias.lower() for alias in user.get("aliases", [])}
+    user_aliases.add(user.get("nickname", "").lower())
+    organizer_email = organizer_email.lower()
     domain_part = organizer_email.rsplit("@", 1)[-1] if "@" in organizer_email else ""
     alias_part = organizer_email.rsplit("@", 1)[0] if "@" in organizer_email else ""
     if (alias_part and alias_part in user_aliases) and (domain_part and domain_part in domain_names):
@@ -2740,7 +2894,11 @@ def import_events_for_user(
 
     thread_prefix = build_thread_prefix(thread_id)
     users_data = get_all_api360_users(settings)
-    user = next((user for user in users_data if user.get("nickname") == nickname), None)
+    nickname_lower = nickname.lower()
+    user = next(
+        (user for user in users_data if (user.get("nickname") or "").lower() == nickname_lower),
+        None,
+    )
     if not user:
         logger.warning(f"{thread_prefix}User '{nickname}' not found.")
         return 0
@@ -2750,90 +2908,105 @@ def import_events_for_user(
         return 0
     token = get_service_app_token(settings, user_email)
     session = build_caldav_session(user_email, token)
+    try:
 
-    calendar_home = discover_calendar_home(user_email, session)
-    if not calendar_home:
-        logger.error(f"{thread_prefix}No calendar home for {user_email}")
-        return 0
+        calendar_home = discover_calendar_home(user_email, session)
+        if not calendar_home:
+            logger.error(f"{thread_prefix}No calendar home for {user_email}")
+            return 0
 
-    calendars = discover_calendars(calendar_home, session)
-    if not calendars:
-        logger.warning(f"{thread_prefix}No calendars found for {user_email}")
-        return 0
+        calendars = discover_calendars(calendar_home, session)
+        if not calendars:
+            logger.warning(f"{thread_prefix}No calendars found for {user_email}")
+            return 0
 
-    default_calendar = pick_default_personal_calendar(calendars)
+        default_calendar = pick_default_personal_calendar(calendars)
 
-    # Build set of all possible user email addresses
-    domains_data = get_all_api360_domains(settings)
-    domain_names = [d.get("name", "") for d in domains_data if d.get("name")]
-    nickname = user.get("nickname", "")
-    unique_aliases = get_all_users_unique_aliases(settings)
+        # Build set of all possible user email addresses
+        domains_data = get_all_api360_domains(settings)
+        domain_names = {d["name"].lower() for d in domains_data if d.get("name")}
+        nickname = user.get("nickname", "")
+        unique_aliases = get_all_users_unique_aliases(settings)
 
-    total_imported = 0
-    for layer_name, files in import_data.items():
-        # Determine target calendar for this layer
-        if layer_name == "DEFAULT":
-            calendar = default_calendar
-            if not calendar:
-                logger.warning(f"{thread_prefix}No default calendar found for {user_email}, skipping layer 'DEFAULT'")
-                for file_path in files:
-                    with report_lock:
-                        report_writer.writerow([user_email, "DEFAULT", file_path, "", "", "skip", "default calendar not found"])
-                continue
-        else:
-            # Find calendar by displayname
-            calendar = None
-            for cal in calendars:
-                cal_name = cal.get("name")
-                if cal_name == layer_name or (cal_name == layer_name.replace("_", " ")):
-                    calendar = cal
-                    break
-            if not calendar:
-                logger.warning(
-                    f"{thread_prefix}Calendar layer '{layer_name}' not found "
-                    f"for {user_email}, importing into default calendar"
-                )
+        total_imported = 0
+        for layer_name, files in import_data.items():
+            # Determine target calendar for this layer
+            if layer_name == "DEFAULT":
                 calendar = default_calendar
                 if not calendar:
-                    logger.warning(
-                        f"{thread_prefix}No default calendar found for "
-                        f"{user_email}, skipping layer '{layer_name}'"
-                    )
+                    logger.warning(f"{thread_prefix}No default calendar found for {user_email}, skipping layer 'DEFAULT'")
                     for file_path in files:
                         with report_lock:
-                            report_writer.writerow([
-                                user_email, layer_name, file_path,
-                                "", "", "skip",
-                                f"layer '{layer_name}' not found, "
-                                f"default calendar not found",
-                            ])
+                            report_writer.writerow([user_email, "DEFAULT", file_path, "", "", "skip", "default calendar not found"])
+                    continue
+            else:
+                # Find calendar by displayname
+                calendar = None
+                for cal in calendars:
+                    cal_name = cal.get("name")
+                    if (
+                        cal_name == layer_name
+                        or cal_name == layer_name.replace("_", " ")
+                        or _layer_file_name(cal_name or "") == layer_name
+                    ):
+                        calendar = cal
+                        break
+                if not calendar:
+                    logger.warning(
+                        f"{thread_prefix}Calendar layer '{layer_name}' not found "
+                        f"for {user_email}, importing into default calendar"
+                    )
+                    calendar = default_calendar
+                    if not calendar:
+                        logger.warning(
+                            f"{thread_prefix}No default calendar found for "
+                            f"{user_email}, skipping layer '{layer_name}'"
+                        )
+                        for file_path in files:
+                            with report_lock:
+                                report_writer.writerow([
+                                    user_email, layer_name, file_path,
+                                    "", "", "skip",
+                                    f"layer '{layer_name}' not found, "
+                                    f"default calendar not found",
+                                ])
+                        continue
+
+            logger.info(f"{thread_prefix}Importing into layer '{layer_name}' (calendar '{calendar['name']}') for {user_email}")
+
+            # Читаем все файлы слоя и группируем события по UID через все файлы:
+            # раньше группировка шла внутри одного файла, и мастер с исключениями,
+            # оказавшиеся в разных файлах, импортировались отдельными PUT-запросами.
+            layer_events: list[tuple[str, str]] = []
+            layer_vtimezones: list[str] = []
+            for file_path in files:
+                try:
+                    with open(file_path, encoding="utf-8-sig") as f:
+                        ics_text = f.read()
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.error(f"{thread_prefix}Failed to read {file_path}: {exc}")
+                    with report_lock:
+                        report_writer.writerow([user_email, layer_name, file_path, "", "", "error", str(exc)])
                     continue
 
-        logger.info(f"{thread_prefix}Importing into layer '{layer_name}' (calendar '{calendar['name']}') for {user_email}")
+                ics_text = html.unescape(ics_text)
+                layer_vtimezones.extend(_extract_vtimezone_blocks(ics_text))
+                layer_events.extend((file_path, ev) for ev in _extract_vevent_blocks(ics_text))
 
-        for file_path in files:
-            try:
-                with open(file_path, encoding="utf-8") as f:
-                    ics_text = f.read()
-            except OSError as exc:
-                logger.error(f"{thread_prefix}Failed to read {file_path}: {exc}")
-                with report_lock:
-                    report_writer.writerow([user_email, layer_name, file_path, "", "", "error", str(exc)])
-                continue
-
-            ics_text = html.unescape(ics_text)
-            vtimezones = _extract_vtimezone_blocks(ics_text)
-            events = _extract_vevent_blocks(ics_text)
-
+            vtimezones = list(dict.fromkeys(layer_vtimezones))
+            event_groups, group_files, duplicates = _group_layer_events(layer_events)
+            if duplicates:
+                logger.warning(
+                    f"{thread_prefix}Layer '{layer_name}' for {user_email}: skipped {duplicates} duplicate VEVENT(s) "
+                    f"(same UID and RECURRENCE-ID)"
+                )
             # Группируем VEVENT-блоки по UID: мастер + исключения (RECURRENCE-ID)
             # идут в одном PUT-запросе, чтобы Яндекс корректно создал
             # повторяющееся событие со всеми смещениями.
-            event_groups = _group_events_by_uid(events)
             event_groups = _filter_event_groups_by_date(event_groups, start, end)
-            if not event_groups:
-                continue
 
             for group_uid, event_group in event_groups.items():
+                file_path = group_files[group_uid]
                 master_ev = event_group[0]
                 uid = _extract_uid_from_event(master_ev)
                 if not uid:
@@ -2871,7 +3044,7 @@ def import_events_for_user(
                         logger.debug(f"{thread_prefix}Event {uid}: organizer changed from '{organizer_email}' to '{user_email}' (replace)")
 
                 action = "create"
-                target_href = f"{uid}.ics"
+                target_href = _event_href_name(uid)
                 etag = None
                 conflict = caldav_find_event_by_uid(calendar["url"], session, uid)
                 if conflict:
@@ -2888,7 +3061,7 @@ def import_events_for_user(
                         # Заменяем UID во всех VEVENT группы
                         event_group = [_replace_uid_in_event(ev, new_uid) for ev in event_group]
                         uid = new_uid
-                        target_href = f"{uid}.ics"
+                        target_href = _event_href_name(uid)
                         action = "create"
 
                 # Применяем правила модификации к каждому VEVENT в группе
@@ -2945,7 +3118,7 @@ def import_events_for_user(
                                 new_uid = str(uuid.uuid4())
                                 regen_group = [_replace_uid_in_event(ev, new_uid) for ev in modified_group]
                                 uid = new_uid
-                                target_href = f"{uid}.ics"
+                                target_href = _event_href_name(uid)
                                 regen_norm, regen_tz = _normalize_event_group_tzids(
                                     regen_group, vtimezones
                                 )
@@ -3004,32 +3177,32 @@ def import_events_for_user(
                         report_writer.writerow([user_email, layer_name, file_path, original_uid, uid, "error", "PUT failed"])
                 time.sleep(SLEEP_TIME_BETWEEN_API_CALLS)
 
-    logger.info(f"{thread_prefix}Imported {total_imported} events for {user_email}")
-    return total_imported
+        logger.info(f"{thread_prefix}Imported {total_imported} events for {user_email}")
+        return total_imported
+    finally:
+        session.close()
+
+
+def _open_report(report_path: str, header: list[str]) -> tuple[csv.writer, TextIO]:
+    report_dir = os.path.dirname(report_path)
+    if report_dir:
+        os.makedirs(report_dir, exist_ok=True)
+    f = open(report_path, "w", encoding="utf-8", newline="")
+    writer = csv.writer(f, delimiter=";")
+    writer.writerow(header)
+    return writer, f
 
 
 def write_import_report_header(report_path: str) -> tuple[csv.writer, TextIO]:
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    f = open(report_path, "w", encoding="utf-8", newline="")
-    writer = csv.writer(f, delimiter=";")
-    writer.writerow(["email", "layer", "file", "original_uid", "saved_uid", "action", "status"])
-    return writer, f
+    return _open_report(report_path, ["email", "layer", "file", "original_uid", "saved_uid", "action", "status"])
 
 
 def write_delete_report_header(report_path: str) -> tuple[csv.writer, TextIO]:
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    f = open(report_path, "w", encoding="utf-8", newline="")
-    writer = csv.writer(f, delimiter=";")
-    writer.writerow(["email", "event-id", "summary", "start_date", "end_date", "status"])
-    return writer, f
+    return _open_report(report_path, ["email", "event-id", "summary", "start_date", "end_date", "status"])
 
 
 def write_rule_apply_report_header(report_path: str) -> tuple[csv.writer, TextIO]:
-    os.makedirs(os.path.dirname(report_path), exist_ok=True)
-    f = open(report_path, "w", encoding="utf-8", newline="")
-    writer = csv.writer(f, delimiter=";")
-    writer.writerow(["file", "rule", "old", "new"])
-    return writer, f
+    return _open_report(report_path, ["file", "rule", "old", "new"])
 
 
 def close_report_writer(report_file) -> None:
@@ -3037,56 +3210,67 @@ def close_report_writer(report_file) -> None:
         report_file.close()
 
 
-def prompt_date_range() -> tuple[Optional[datetime], Optional[datetime]]:
+_DATE_OFFSET_RE = re.compile(r"^[+-]\d+[dDwWmMyY]$")
+
+
+def _is_valid_range_part(value: str) -> bool:
+    if value == "*":
+        return True
+    try:
+        return parse_date_input(value) is not None
+    except ValueError:
+        return False
+
+
+def _split_date_range(value: str) -> Optional[tuple[str, str]]:
+    """Делит строку диапазона по тому дефису, с обеих сторон которого стоят корректные даты.
+
+    Раньше строка делилась по первому '-', поэтому не работали форматы
+    YYYY-MM-DD (2024-01-01 - 2024-12-31) и смещения (-7d - +7d), которые
+    поддерживает parse_date_input.
+    """
+    for idx, ch in enumerate(value):
+        if ch != "-" or idx == 0:
+            continue
+        left, right = value[:idx], value[idx + 1:]
+        if left and right and _is_valid_range_part(left) and _is_valid_range_part(right):
+            return left, right
+    return None
+
+
+def prompt_date_range() -> tuple[bool, Optional[datetime], Optional[datetime]]:
     """
     Запрашивает у пользователя диапазон дат в формате <начало> - <конец> (включительно) (* для любой даты).
-    Возвращает кортеж из успеха ввода и двух объектов datetime или None, если пользователь ввел пустую строку.
+    Возвращает кортеж из успеха ввода и двух объектов datetime (None — граница не задана).
     """
     print('\nВведите диапазон дат в формате <начало> - <конец> (включительно) (* для любой даты).')
     print('Например: 01.01.2024 - 31.12.2024, * - 31.12.24, * или Enter — все даты.\n')
     while True:
         date_range_input = input('Диапазон: ').strip()
-        if not date_range_input:
-            return True, None, None
-
         # Удаляем пробелы вокруг и между дат и дефисом
         date_range_input = date_range_input.replace(' ', '')
-
-        if date_range_input == '*':
+        if not date_range_input or date_range_input == '*':
             return True, None, None
 
-        if '-' not in date_range_input:
-            print('Ошибка: Некорректный формат. Введите даты через дефис ("-") либо * для пропуска.')
+        parts = _split_date_range(date_range_input)
+        if not parts:
+            print('Ошибка: Некорректный формат. Введите две даты через дефис ("-") либо * для пропуска.')
             continue
 
-        from_value, to_value = date_range_input.split('-', 1)
-        # Обрабатываем "*"
-        start = None if from_value == '*' else None
-        end = None if to_value == '*' else None
+        from_value, to_value = parts
+        start = None if from_value == '*' else parse_date_input(from_value)
+        end = None if to_value == '*' else parse_date_input(to_value)
 
-        valid = True
+        # Конечная дата включительно: без этого "31.12.2024" означало 31.12.2024 00:00,
+        # и события последнего дня диапазона не попадали в выборку.
+        if end is not None and not _DATE_OFFSET_RE.match(to_value):
+            end = end.replace(hour=23, minute=59, second=59)
 
-        if from_value != '*':
-            try:
-                start = parse_date_input(from_value)
-            except Exception:
-                print('Ошибка: Некорректная начальная дата. Попробуйте снова.')
-                valid = False
-        if to_value != '*':
-            try:
-                end = parse_date_input(to_value)
-            except Exception:
-                print('Ошибка: Некорректная конечная дата. Попробуйте снова.')
-                valid = False
-
-        if valid and start is not None and end is not None and start > end:
+        if start is not None and end is not None and start > end:
             print('Ошибка: Начальная дата не может быть позже конечной. Попробуйте снова.')
-            valid = False
+            continue
 
-        if valid:
-            break
-
-    return True, start, end
+        return True, start, end
 
 
 def prompt_conflict_policy() -> str:
@@ -3094,120 +3278,94 @@ def prompt_conflict_policy() -> str:
     print("1. Пропустить импортируемые события")
     print("2. Заменить существующие события")
     print("3. Сгенерировать новый UID")
-    choice = input("Выбор (1-3) (Enter — выход в меню): ").strip()
     while True:
+        choice = input("Выбор (1-3) (Enter — выход в меню): ").strip()
         if not choice:
             return "exit"
         if choice in {"1", "2", "3"}:
             return {"1": "skip", "2": "replace", "3": "regen"}[choice]
-        else:
-            print("\nОшибка: введите 1, 2 или 3.")
-            choice = input("Выбор (1-3) (Enter — выход в меню): ").strip()
+        print("\nОшибка: введите 1, 2 или 3.")
+
 
 def prompt_change_organizer_policy() -> str:
     print("\nСобытия, где организатор не совпадает с пользователем, куда импортируются события,")
     print("не могут быть сохранены без модификации организатора. Выберите действие:")
     print("1. Не менять организатора, событие не будет импортировано.")
     print("2. Заменить организатора на пользователя, куда импортируются события.")
-    choice = input("Выбор (1-2) (Enter — выход в меню): ").strip()
     while True:
+        choice = input("Выбор (1-2) (Enter — выход в меню): ").strip()
         if not choice:
             return "exit"
         if choice in {"1", "2"}:
             return {"1": "skip", "2": "replace"}[choice]
+        print("\nОшибка: введите 1 или 2.")
+
+
+def prompt_query_filter() -> str:
+    print("\nВведите фильтр для событий (в формате: ical_TAG operator value)")
+    print("Например: CLASS:Public или ORGANIZER contains john.doe@example.com\n")
+    return input("Фильтр (Enter - без фильтра): ").strip()
+
+
+def _split_active_users(users: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Делит пользователей на доступных для работы с календарём и заблокированных.
+    Пользователи с личной учёткой (id не с 113...) пропускаются."""
+    active: list[dict] = []
+    blocked: list[dict] = []
+    for user in users:
+        user_display = user.get("nickname") or user.get("id") or str(user)
+        if not user.get("isEnabled", True):
+            logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
+            blocked.append(user)
+        elif not str(user.get('id')).startswith('113'):
+            logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
         else:
-            print("\nОшибка: введите 1 или 2.")
-            choice = input("Выбор (1-2) (Enter — выход в меню): ").strip()
+            active.append(user)
+    return active, blocked
 
 
-def export_menu(settings: "SettingParams"):
-
+def _prompt_active_users(settings: "SettingParams") -> Optional[tuple[list[dict], list[dict]]]:
+    """Запрашивает пользователей до тех пор, пока не останется хотя бы один доступный.
+    Возвращает (доступные, заблокированные) или None для выхода в меню."""
     while True:
         users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
         if break_flag or double_users_flag or not users_to_add:
-            return
-        # Фильтруем заблокированных пользователей (isEnabled == False)
-        filtered_users = []
-        for user in users_to_add:
-            user_enabled = user.get("isEnabled", True)
-            user_display = user.get("nickname") or user.get("id") or str(user)
-            if not user_enabled:
-                logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-            else:
-                if not str(user.get('id')).startswith('113'):
-                    logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-                else:
-                    filtered_users.append(user)
+            return None
+        active, blocked = _split_active_users(users_to_add)
+        if active:
+            return active, blocked
+        logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
 
-        if not filtered_users:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-            continue
-        users_to_add = filtered_users
-        if not users_to_add:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-        else:
-            break
-        
-    result, start, end = prompt_date_range()
-    if not result:
-        return
-    print("\nВведите фильтр для событий (в формате: ical_TAG operator value)")
-    print("Например: CLASS:Public или ORGANIZER contains john.doe@example.com\n")
-    query_filter = input("Фильтр (Enter - без фильтра): ").strip()
 
-    for idx, user in enumerate(users_to_add, start=1):
-        export_events_for_user(settings, user, start, end, query_filter, thread_id=idx)
+def _wait_futures(futures: dict) -> None:
+    """Дожидается задач пула. Ошибка одного пользователя (например, TokenError) больше
+    не прерывает всю операцию и не завершает скрипт — она логируется, остальные продолжают."""
+    for future, label in futures.items():
+        try:
+            future.result()
+        except Exception as exc:
+            logger.error(f"Ошибка при обработке {label}: {type(exc).__name__}: {exc}")
+            logger.debug(traceback.format_exc())
 
 
 def export_menu_parallel(settings: "SettingParams"):
-    while True:
-        users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
-        if break_flag or double_users_flag or not users_to_add:
-            return
-        # Фильтруем заблокированных пользователей (isEnabled == False)
-        filtered_users = []
-        for user in users_to_add:
-            user_enabled = user.get("isEnabled", True)
-            user_display = user.get("nickname") or user.get("id") or str(user)
-            if not user_enabled:
-                logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-            else:
-                if not str(user.get('id')).startswith('113'):
-                    logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-                else:
-                    filtered_users.append(user)
-
-        if not filtered_users:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-            continue
-        users_to_add = filtered_users
-        if not users_to_add:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-        else:
-            break
+    selected = _prompt_active_users(settings)
+    if selected is None:
+        return
+    users_to_add, _blocked = selected
 
     result, start, end = prompt_date_range()
     if not result:
         return
-    print("\nВведите фильтр для событий (в формате: ical_TAG operator value)")
-    print("Например: CLASS:Public или ORGANIZER contains john.doe@example.com\n")
-    query_filter = input("Фильтр (Enter - без фильтра): ").strip()
+    query_filter = prompt_query_filter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
-        futures = []
-        for idx, user in enumerate(users_to_add, start=1):
-            futures.append(
-                executor.submit(
-                    export_events_for_user,
-                    settings,
-                    user,
-                    start,
-                    end,
-                    query_filter,
-                    idx,
-                )
-            )
-        for future in futures:
-            future.result()
+        futures = {
+            executor.submit(export_events_for_user, settings, user, start, end, query_filter, idx):
+                user.get("email") or user.get("nickname")
+            for idx, user in enumerate(users_to_add, start=1)
+        }
+        _wait_futures(futures)
+
 
 def export_from_external_caldav_server(settings: "SettingParams"):
 
@@ -3219,66 +3377,30 @@ def export_from_external_caldav_server(settings: "SettingParams"):
         users_to_add, break_flag = get_external_caldav_users_prompt(settings)
         if break_flag:
             return
-        else:
-            if not users_to_add:
-                continue
-            else:
-                break
+        if users_to_add:
+            break
 
     logger.info(f"Будут экспортированы события из календаря по умолчанию для {len(users_to_add)} пользователей.")
     result, start, end = prompt_date_range()
     if not result:
         return
-    print("\nВведите фильтр для событий (в формате: ical_TAG operator value)")
-    print("Например: CLASS:Public или ORGANIZER contains john.doe@example.com\n")
-    query_filter = input("Фильтр (Enter - без фильтра): ").strip()
+    query_filter = prompt_query_filter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
-        futures = []
-        for idx, user in enumerate(users_to_add):
-            futures.append(
-                executor.submit(
-                    export_events_for_user,
-                    settings,
-                    user,
-                    start,
-                    end,
-                    query_filter,
-                    idx,
-                    settings.external_caldav_url,
-                )
-            )
-        for future in futures:
-            future.result()
+        futures = {
+            executor.submit(
+                export_events_for_user,
+                settings, user, start, end, query_filter, idx, settings.external_caldav_url,
+            ): user.get("login")
+            for idx, user in enumerate(users_to_add, start=1)
+        }
+        _wait_futures(futures)
 
 
 def delete_menu_parallel(settings: "SettingParams"):
-    while True:
-        users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
-        if break_flag or double_users_flag or not users_to_add:
-            return
-        # Фильтруем заблокированных пользователей (isEnabled == False)
-        filtered_users = []
-        blocked_users = []
-        for user in users_to_add:
-            user_enabled = user.get("isEnabled", True)
-            user_display = user.get("nickname") or user.get("id") or str(user)
-            if not user_enabled:
-                logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-                blocked_users.append(user)
-            else:
-                if not str(user.get('id')).startswith('113'):
-                    logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-                else:
-                    filtered_users.append(user)
-
-        if not filtered_users:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-            continue
-        users_to_add = filtered_users
-        if not users_to_add:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-        else:
-            break
+    selected = _prompt_active_users(settings)
+    if selected is None:
+        return
+    users_to_add, blocked_users = selected
 
     result, start, end = prompt_date_range()
     if not result:
@@ -3300,14 +3422,14 @@ def delete_menu_parallel(settings: "SettingParams"):
         date_info = " за все даты"
     print(f"Диапазон дат:{date_info}")
     if settings.create_cancel_rules_for_events_deletions:
-        print("\nВ глобальных настройка установлена опция автоматического создания транспортного правила")
+        print("\nВ глобальных настройках установлена опция автоматического создания транспортного правила")
         print("для блокировки уведомлений об удалении событий (если такого правила ещё нет).")
         print("Если вы хотите отключить эту опцию, установите параметр CREATE_CANCEL_RULES_FOR_EVENTS_DELETIONS=false в .env.")
     else:
-        print("\nВ глобальных настройка выключена опция автоматического создания транспортного правила")
+        print("\nВ глобальных настройках выключена опция автоматического создания транспортного правила")
         print("для блокировки уведомлений об удалении событий (если такого правила ещё нет).")
         print("!!! ВСЕМ УЧАСТНИКАМ УДАЛЯЕМЫХ СОБЫТИЙ БУДЕТ ОТПРАВЛЕНО УВЕДОМЛЕНИЕ ОБ УДАЛЕНИИ.")
-        print("Если вы хотите отключить такие уведомления, установите параметр CREATE_CANCEL_RULES_FOR_EVENTS_DELETIONS=false в .env.")
+        print("Если вы хотите отключить такие уведомления, установите параметр CREATE_CANCEL_RULES_FOR_EVENTS_DELETIONS=true в .env.")
     confirm = input("\nПодтвердите удаление (yes/да): ").strip().lower()
     if confirm not in ("yes", "да", "y"):
         print("Удаление отменено.")
@@ -3326,100 +3448,52 @@ def delete_menu_parallel(settings: "SettingParams"):
             writer.writerow([user_email, "", "", "", "", "user blocked, skip"])
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
-            futures = []
-            for idx, user in enumerate(users_to_add, start=1):
-                futures.append(
-                    executor.submit(
-                        delete_events_for_user,
-                        settings,
-                        user,
-                        start,
-                        end,
-                        writer,
-                        report_lock,
-                        idx,
-                    )
-                )
-            for future in futures:
-                future.result()
+            futures = {
+                executor.submit(
+                    delete_events_for_user, settings, user, start, end, writer, report_lock, idx,
+                ): user.get("email")
+                for idx, user in enumerate(users_to_add, start=1)
+            }
+            _wait_futures(futures)
     finally:
         close_report_writer(report_file)
     logger.info(f"Отчёт об удалении сохранён в {report_path}")
 
 
+def _user_aliases(user: dict) -> list[str]:
+    aliases = user.get("aliases", [])
+    if isinstance(aliases, str):
+        return [a.strip().lower() for a in aliases.split(",") if a.strip()]
+    if isinstance(aliases, list):
+        return [a.strip().lower() for a in aliases if isinstance(a, str) and a.strip()]
+    return []
 
-def import_menu_parallel(settings: "SettingParams"):
-    files_map = parse_input_files(settings.input_dir)
-    if not files_map:
-        logger.error(f"No input .ics files found in {settings.input_dir}")
-        return
 
-    user_mapping = load_user_mapping(settings.user_mapping_file)
-    files_map, mapping_applied = apply_user_mapping(files_map, user_mapping)
+def _user_matches_key(user: dict, key: str) -> bool:
+    nickname = (user.get("nickname") or "").strip().lower()
+    key_lower = key.strip().lower()
+    return bool(nickname) and (key_lower == nickname or key_lower in _user_aliases(user))
 
-    while True:
-        users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
-        if break_flag or double_users_flag or not users_to_add:
-            return
-        # Фильтруем заблокированных пользователей (isEnabled == False)
-        filtered_users = []
-        blocked_users = []
-        for user in users_to_add:
-            user_enabled = user.get("isEnabled", True)
-            user_display = user.get("nickname") or user.get("id") or str(user)
-            if not user_enabled:
-                logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-                blocked_users.append(user)
-            else:
-                if not str(user.get('id')).startswith('113'):
-                    logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-                else:
-                    filtered_users.append(user)
 
-        if not filtered_users:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-            continue
-        users_to_add = filtered_users
-        if not users_to_add:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-        else:
-            break
-
-    filtered_files_map = {}
-    # Для каждого пользователя ищем его файлы по nickname и aliases,
-    # нормализуя ключ к nickname
-    for user in users_to_add:
+def _build_user_files_map(
+    users: list[dict], files_map: dict[str, dict[str, list[str]]]
+) -> dict[str, dict[str, list[str]]]:
+    """Для каждого пользователя собирает его файлы по nickname и aliases,
+    нормализуя ключ к nickname. Дубликаты имён файлов в слое отбрасываются."""
+    filtered_files_map: dict[str, dict[str, list[str]]] = {}
+    for user in users:
         nickname = (user.get("nickname") or "").strip().lower()
         if not nickname:
             continue
-        aliases = user.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [a.strip().lower() for a in aliases.split(",") if a.strip()]
-        elif isinstance(aliases, list):
-            aliases = [a.strip().lower() for a in aliases if isinstance(a, str) and a.strip()]
-        else:
-            aliases = []
-
         for key, layers in files_map.items():
-            key_lower = key.strip().lower()
-            if key_lower == nickname or key_lower in aliases:
-                if nickname not in filtered_files_map:
-                    # Первое вхождение — копируем слои
-                    filtered_files_map[nickname] = {k: list(v) for k, v in layers.items()}
-                else:
-                    # Объединяем слои по имени
-                    existing = filtered_files_map[nickname]
-                    for layer_name, layer_files in layers.items():
-                        if layer_name in existing:
-                            existing[layer_name].extend(layer_files)
-                        else:
-                            existing[layer_name] = list(layer_files)
-                if key_lower != nickname:
-                    logger.debug(f"Файлы из '{key}' перенесены в ключ '{nickname}' (алиас -> nickname)")
-            else:
-                logger.debug(f"Файлы для '{key}' пропущены: ключ не совпадает с nickname '{nickname}' и не найден среди его алиасов")
+            if not _user_matches_key(user, key):
+                continue
+            existing = filtered_files_map.setdefault(nickname, {})
+            for layer_name, layer_files in layers.items():
+                existing.setdefault(layer_name, []).extend(layer_files)
+            if key.strip().lower() != nickname:
+                logger.debug(f"Файлы из '{key}' перенесены в ключ '{nickname}' (алиас -> nickname)")
 
-    # Выполняем проверку на уникальность имён файлов в filtered_files_map
     for nickname, user_layers in filtered_files_map.items():
         for layer_name, files in user_layers.items():
             seen_files = set()
@@ -3437,17 +3511,111 @@ def import_menu_parallel(settings: "SettingParams"):
                     f"Обнаружены дубликаты файлов для пользователя '{nickname}', слой '{layer_name}': "
                     f"{', '.join(duplicate_files)}. Дубликаты удалены."
                 )
-                user_layers[layer_name] = unique_files   
+                user_layers[layer_name] = unique_files
+    return filtered_files_map
 
-    total_users = len(filtered_files_map)
+
+def _run_import(
+    settings: "SettingParams",
+    user_files_map: dict[str, dict[str, list[str]]],
+    all_files_map: dict[str, dict[str, list[str]]],
+    blocked_users: list[dict],
+    mapping_applied: list[tuple[str, str]],
+    conflict_policy: str,
+    change_organizer_policy: str,
+    start: Optional[datetime],
+    end: Optional[datetime],
+) -> None:
+    ics_modify_rules = load_modify_rules(settings)
+    timestamp = datetime.now().strftime('%y%m%d_%H%M%S')
+    report_path = os.path.join(settings.reports_dir, f"import_{timestamp}.csv")
+    writer, report_file = write_import_report_header(report_path)
+    report_lock = threading.Lock()
+    rule_apply_base, rule_apply_ext = os.path.splitext(settings.rule_apply_report)
+    rule_apply_path = os.path.join(settings.reports_dir, f"{rule_apply_base}_{timestamp}{rule_apply_ext}")
+    rule_apply_writer, rule_apply_file = write_rule_apply_report_header(rule_apply_path)
+    rule_apply_lock = threading.Lock()
+    try:
+        # Файлы заблокированных пользователей — в отчёт (колонки как в заголовке отчёта;
+        # раньше строка писалась со сдвигом: файл в колонке layer, статус в saved_uid).
+        for user in blocked_users:
+            nickname = (user.get("nickname") or "").strip().lower()
+            if not nickname:
+                continue
+            for key, layers in all_files_map.items():
+                if not _user_matches_key(user, key):
+                    continue
+                for layer_name, layer_files in layers.items():
+                    for fname in layer_files:
+                        writer.writerow([nickname, layer_name, fname, "", "", "skip", "user blocked"])
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
+            futures = {
+                executor.submit(
+                    import_events_for_user,
+                    settings,
+                    nickname,
+                    data,
+                    start,
+                    end,
+                    conflict_policy,
+                    ics_modify_rules,
+                    writer,
+                    report_lock,
+                    idx,
+                    rule_apply_writer=rule_apply_writer,
+                    rule_apply_lock=rule_apply_lock,
+                    change_organizer_policy=change_organizer_policy,
+                ): nickname
+                for idx, (nickname, data) in enumerate(user_files_map.items(), start=1)
+            }
+            _wait_futures(futures)
+    finally:
+        close_report_writer(report_file)
+        close_report_writer(rule_apply_file)
+    logger.info(f"Import report saved to {report_path}")
+    logger.info(f"Rule apply report saved to {rule_apply_path}")
+    if mapping_applied:
+        logger.info(f"User mapping: при импорте были применены следующие замены алиасов ({len(mapping_applied)}):")
+        for ext_a, y360_a in mapping_applied:
+            logger.info(f"  '{ext_a}' -> '{y360_a}'")
+    else:
+        logger.info("User mapping: замены алиасов не применялись.")
+
+
+def _log_files_map_totals(user_files_map: dict[str, dict[str, list[str]]]) -> None:
     total_files = sum(
         len(file_list)
-        for user_layers in filtered_files_map.values()
+        for user_layers in user_files_map.values()
         for file_list in user_layers.values()
     )
-    logger.info(f"Для обработки выбрано пользователей: {total_users}, всего файлов: {total_files}")
-    files_map_original = files_map
-    files_map = filtered_files_map
+    logger.info(f"Для обработки выбрано пользователей: {len(user_files_map)}, всего файлов: {total_files}")
+
+
+def _load_input_files_map(settings: "SettingParams"):
+    files_map = parse_input_files(settings.input_dir)
+    if not files_map:
+        logger.error(f"No input .ics files found in {settings.input_dir}")
+        return None, []
+    user_mapping = load_user_mapping(settings.user_mapping_file)
+    return apply_user_mapping(files_map, user_mapping)
+
+
+def import_menu_parallel(settings: "SettingParams"):
+    files_map, mapping_applied = _load_input_files_map(settings)
+    if not files_map:
+        return
+
+    selected = _prompt_active_users(settings)
+    if selected is None:
+        return
+    users_to_add, blocked_users = selected
+
+    user_files_map = _build_user_files_map(users_to_add, files_map)
+    _log_files_map_totals(user_files_map)
+    if not user_files_map:
+        logger.error(f"В каталоге {settings.input_dir} нет файлов для выбранных пользователей.")
+        return
 
     conflict_policy = prompt_conflict_policy()
     if conflict_policy == "exit":
@@ -3458,290 +3626,74 @@ def import_menu_parallel(settings: "SettingParams"):
     result, start, end = prompt_date_range()
     if not result:
         return
-    ics_modify_rules = load_modify_rules(settings)
-    timestamp = datetime.now().strftime('%y%m%d_%H%M%S')
-    report_name = f"import_{timestamp}.csv"
-    report_path = os.path.join(settings.reports_dir, report_name)
-    writer, report_file = write_import_report_header(report_path)
-    report_lock = threading.Lock()
-    rule_apply_base, rule_apply_ext = os.path.splitext(settings.rule_apply_report)
-    rule_apply_name = f"{rule_apply_base}_{timestamp}{rule_apply_ext}"
-    rule_apply_path = os.path.join(settings.reports_dir, rule_apply_name)
-    rule_apply_writer, rule_apply_file = write_rule_apply_report_header(rule_apply_path)
-    rule_apply_lock = threading.Lock()
-    # Записываем файлы заблокированных пользователей в отчёт
-    for user in blocked_users:
-        nickname = (user.get("nickname") or "").strip().lower()
-        if not nickname:
-            continue
-        aliases = user.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [a.strip().lower() for a in aliases.split(",") if a.strip()]
-        elif isinstance(aliases, list):
-            aliases = [a.strip().lower() for a in aliases if isinstance(a, str) and a.strip()]
-        else:
-            aliases = []
-        for key, layers in files_map_original.items():
-            key_lower = key.strip().lower()
-            if key_lower == nickname or key_lower in aliases:
-                for layer_name, layer_files in layers.items():
-                    for fname in layer_files:
-                        writer.writerow([nickname, fname, layer_name, "", "User blocked", "skip"])
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
-            futures = []
-            for idx, (nickname, data) in enumerate(files_map.items(), start=1):
-                futures.append(
-                    executor.submit(
-                        import_events_for_user,
-                        settings,
-                        nickname,
-                        data,
-                        start,
-                        end,
-                        conflict_policy,
-                        ics_modify_rules,
-                        writer,
-                        report_lock,
-                        idx,
-                        rule_apply_writer=rule_apply_writer,
-                        rule_apply_lock=rule_apply_lock,
-                        change_organizer_policy=change_organizer_policy,
-                    )
-                )
-            for future in futures:
-                future.result()
-    finally:
-        close_report_writer(report_file)
-        close_report_writer(rule_apply_file)
-    logger.info(f"Import report saved to {report_path}")
-    logger.info(f"Rule apply report saved to {rule_apply_path}")
-    if mapping_applied:
-        logger.info(f"User mapping: при импорте были применены следующие замены алиасов ({len(mapping_applied)}):")
-        for ext_a, y360_a in mapping_applied:
-            logger.info(f"  '{ext_a}' -> '{y360_a}'")
-    else:
-        logger.info("User mapping: замены алиасов не применялись.")
+
+    _run_import(
+        settings, user_files_map, files_map, blocked_users, mapping_applied,
+        conflict_policy, change_organizer_policy, start, end,
+    )
+
 
 def import_menu_parallel_without_params(settings: "SettingParams"):
     print(f"\nИмпорт событий из ics файлов в каталоге {settings.input_dir}.")
-    print("Будут импортированы все события из ics файлов в каталоге.")
+    print("Будут импортированы все события из ics файлов в каталоге для всех пользователей организации.")
     print("В случае дубликатов UID событий будут генерированы новые UID.")
-    print(f"К событиям будут применены правила модификации из файла {settings.rule_apply_report}.")
+    print("События, где пользователь не является организатором, будут пропущены.")
+    print(f"К событиям будут применены правила модификации из файла {settings.modify_rules}.")
     answer = input("Подтвердите импорт (yes/да): ").strip().lower()
     if answer not in ("yes", "да", "y"):
         print("Импорт отменен.")
         return
-    files_map = parse_input_files(settings.input_dir)
+
+    files_map, mapping_applied = _load_input_files_map(settings)
     if not files_map:
-        logger.error(f"No input .ics files found in {settings.input_dir}")
         return
 
-    user_mapping = load_user_mapping(settings.user_mapping_file)
-    files_map, mapping_applied = apply_user_mapping(files_map, user_mapping)
-
-    users_to_add =get_all_api360_users(settings)
-    
-    # Фильтруем заблокированных пользователей (isEnabled == False)
-    filtered_users = []
-    blocked_users = []
-    for user in users_to_add:
-        user_enabled = user.get("isEnabled", True)
-        user_display = user.get("nickname") or user.get("id") or str(user)
-        if not user_enabled:
-            logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-            blocked_users.append(user)
-        else:
-            if not str(user.get('id')).startswith('113'):
-                logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-            else:
-                filtered_users.append(user)
-
-    if not filtered_users:
-        logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
+    users_to_add, blocked_users = _split_active_users(get_all_api360_users(settings))
+    if not users_to_add:
+        logger.error("После фильтрации не осталось пользователей для обработки.")
         return
-    users_to_add = filtered_users
 
-    filtered_files_map = {}
-    # Для каждого пользователя ищем его файлы по nickname и aliases,
-    # нормализуя ключ к nickname
-    for user in users_to_add:
-        nickname = (user.get("nickname") or "").strip().lower()
-        if not nickname:
-            continue
-        aliases = user.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [a.strip().lower() for a in aliases.split(",") if a.strip()]
-        elif isinstance(aliases, list):
-            aliases = [a.strip().lower() for a in aliases if isinstance(a, str) and a.strip()]
-        else:
-            aliases = []
+    user_files_map = _build_user_files_map(users_to_add, files_map)
+    _log_files_map_totals(user_files_map)
+    if not user_files_map:
+        logger.error(f"В каталоге {settings.input_dir} нет файлов для пользователей организации.")
+        return
 
-        for key, layers in files_map.items():
-            key_lower = key.strip().lower()
-            if key_lower == nickname or key_lower in aliases:
-                if nickname not in filtered_files_map:
-                    # Первое вхождение — копируем слои
-                    filtered_files_map[nickname] = {k: list(v) for k, v in layers.items()}
-                else:
-                    # Объединяем слои по имени
-                    existing = filtered_files_map[nickname]
-                    for layer_name, layer_files in layers.items():
-                        if layer_name in existing:
-                            existing[layer_name].extend(layer_files)
-                        else:
-                            existing[layer_name] = list(layer_files)
-                if key_lower != nickname:
-                    logger.debug(f"Файлы из '{key}' перенесены в ключ '{nickname}' (алиас -> nickname)")
-            else:
-                logger.debug(f"Файлы для '{key}' пропущены: ключ не совпадает с nickname '{nickname}' и не найден среди его алиасов")
-
-    # Выполняем проверку на уникальность имён файлов в filtered_files_map
-    for nickname, user_layers in filtered_files_map.items():
-        for layer_name, files in user_layers.items():
-            seen_files = set()
-            unique_files = []
-            duplicate_files = []
-            for fname in files:
-                base_fname = os.path.basename(fname)
-                if base_fname in seen_files:
-                    duplicate_files.append(base_fname)
-                else:
-                    seen_files.add(base_fname)
-                    unique_files.append(fname)
-            if duplicate_files:
-                logger.warning(
-                    f"Обнаружены дубликаты файлов для пользователя '{nickname}', слой '{layer_name}': "
-                    f"{', '.join(duplicate_files)}. Дубликаты удалены."
-                )
-                user_layers[layer_name] = unique_files   
-
-    total_users = len(filtered_files_map)
-    total_files = sum(
-        len(file_list)
-        for user_layers in filtered_files_map.values()
-        for file_list in user_layers.values()
+    _run_import(
+        settings, user_files_map, files_map, blocked_users, mapping_applied,
+        conflict_policy="regen", change_organizer_policy="skip", start=None, end=None,
     )
-    logger.info(f"Для обработки выбрано пользователей: {total_users}, всего файлов: {total_files}")
-    files_map_original = files_map
-    files_map = filtered_files_map
-
-    conflict_policy = "regen"
-    if conflict_policy == "exit":
-        return
-    start, end = None, None
-
-    ics_modify_rules = load_modify_rules(settings)
-    timestamp = datetime.now().strftime('%y%m%d_%H%M%S')
-    report_name = f"import_{timestamp}.csv"
-    report_path = os.path.join(settings.reports_dir, report_name)
-    writer, report_file = write_import_report_header(report_path)
-    report_lock = threading.Lock()
-    rule_apply_base, rule_apply_ext = os.path.splitext(settings.rule_apply_report)
-    rule_apply_name = f"{rule_apply_base}_{timestamp}{rule_apply_ext}"
-    rule_apply_path = os.path.join(settings.reports_dir, rule_apply_name)
-    rule_apply_writer, rule_apply_file = write_rule_apply_report_header(rule_apply_path)
-    rule_apply_lock = threading.Lock()
-    # Записываем файлы заблокированных пользователей в отчёт
-    for user in blocked_users:
-        nickname = (user.get("nickname") or "").strip().lower()
-        if not nickname:
-            continue
-        aliases = user.get("aliases", [])
-        if isinstance(aliases, str):
-            aliases = [a.strip().lower() for a in aliases.split(",") if a.strip()]
-        elif isinstance(aliases, list):
-            aliases = [a.strip().lower() for a in aliases if isinstance(a, str) and a.strip()]
-        else:
-            aliases = []
-        for key, layers in files_map_original.items():
-            key_lower = key.strip().lower()
-            if key_lower == nickname or key_lower in aliases:
-                for layer_name, layer_files in layers.items():
-                    for fname in layer_files:
-                        writer.writerow([nickname, fname, layer_name, "", "User blocked", "skip"])
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=settings.threads) as executor:
-            futures = []
-            for idx, (nickname, data) in enumerate(files_map.items(), start=1):
-                futures.append(
-                    executor.submit(
-                        import_events_for_user,
-                        settings,
-                        nickname,
-                        data,
-                        start,
-                        end,
-                        conflict_policy,
-                        ics_modify_rules,
-                        writer,
-                        report_lock,
-                        idx,
-                        rule_apply_writer=rule_apply_writer,
-                        rule_apply_lock=rule_apply_lock,
-                    )
-                )
-            for future in futures:
-                future.result()
-    finally:
-        close_report_writer(report_file)
-        close_report_writer(rule_apply_file)
-    logger.info(f"Import report saved to {report_path}")
-    logger.info(f"Rule apply report saved to {rule_apply_path}")
-    if mapping_applied:
-        logger.info(f"User mapping: при импорте были применены следующие замены алиасов ({len(mapping_applied)}):")
-        for ext_a, y360_a in mapping_applied:
-            logger.info(f"  '{ext_a}' -> '{y360_a}'")
-    else:
-        logger.info("User mapping: замены алиасов не применялись.")
 
 
 def list_calendars_for_user(settings: "SettingParams"):
-    while True:
-        users_to_add, break_flag, double_users_flag, _all_users_flag = find_users_prompt(settings)
-        if break_flag or double_users_flag or not users_to_add:
-            return
-        # Фильтруем заблокированных пользователей (isEnabled == False)
-        filtered_users = []
-        for user in users_to_add:
-            user_enabled = user.get("isEnabled", True)
-            user_display = user.get("nickname") or user.get("id") or str(user)
-            if not user_enabled:
-                logger.error(f"Пользователь {user_display} заблокирован, работа с его календарём невозможна. Пропуск пользователя.")
-            else:
-                if not str(user.get('id')).startswith('113'):
-                    logger.debug(f"Пользователь {user_display} имеет личную учётку, работа с его календарём невозможна.")
-                else:
-                    filtered_users.append(user)
+    selected = _prompt_active_users(settings)
+    if selected is None:
+        return
+    users_to_add, _blocked = selected
 
-        if not filtered_users:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-            continue
-        users_to_add = filtered_users
-        if not users_to_add:
-            logger.error("После фильтрации не осталось пользователей для обработки. Попробуйте ввести пользователей заново.")
-        else:
-            break
-        
     for user in users_to_add:
         user_email = user.get("email")
         if not user_email:
             continue
-        token = get_service_app_token(settings, user_email)
-        session = build_caldav_session(user_email, token)
-        calendar_home = discover_calendar_home(user_email, session)
-        if not calendar_home:
-            logger.error(f"No calendar home for {user_email}")
+        try:
+            token = get_service_app_token(settings, user_email)
+        except TokenError as exc:
+            logger.error(f"Не удалось получить токен для {user_email}: {exc}")
             continue
-        calendars = discover_calendars(calendar_home, session)
+        with build_caldav_session(user_email, token) as session:
+            calendar_home = discover_calendar_home(user_email, session)
+            if not calendar_home:
+                logger.error(f"No calendar home for {user_email}")
+                continue
+            calendars = discover_calendars(calendar_home, session)
         default_calendar = pick_default_personal_calendar(calendars)
         logger.info(f"Calendars for {user_email}:")
         for cal in calendars:
             cal_name = cal['name']
-            is_default = default_calendar and cal["url"] == default_calendar["url"]
-            if is_default:
+            if default_calendar and cal["url"] == default_calendar["url"]:
                 cal_name += " (по умолчанию)"
             logger.info(f" - {cal_name} ({cal['url']})")
+
 
 def check_token_permissions_simple(token: str, org_id: int, needed_permissions: list) -> tuple[bool, bool]:
             
@@ -3796,7 +3748,8 @@ def check_token_permissions_for_service_application(settings: "SettingParams") -
     needed_permissions = ["ya360_security:service_applications_read",
                           "ya360_security:service_applications_write",]
 
-    result, data = check_token_permissions_api(settings.oauth_token, settings.org_id, needed_permissions)
+    # Раньше функция вызывалась с тремя аргументами при сигнатуре из одного -> TypeError
+    result, data = check_token_permissions_api(settings.oauth_token)
     if not result:
         return False
     else:
@@ -3839,11 +3792,10 @@ def check_token_permissions_api(token: str) -> tuple[bool, dict]:
     headers = {
         'Authorization': f'OAuth {token}'
     }
-    success = False
     result = None
     try:
         response = requests.get(url, headers=headers)
-        
+
         # Проверка валидности токена
         if response.status_code != HTTPStatus.OK:
             logger.error(f"Невалидный токен. Статус код: {response.status_code}")
@@ -3889,7 +3841,7 @@ def activate_service_applications(settings: "SettingParams") -> bool:
                 logger.error(f"Ошибка при активации сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -3904,7 +3856,16 @@ def activate_service_applications(settings: "SettingParams") -> bool:
         logger.error(f"Неожиданная ошибка при активации сервисных приложений: {type(e).__name__}: {e}")
         return False
 
-def get_service_applications(settings: "SettingParams") -> Optional[list]:
+def _api_error_message(response: requests.Response) -> str:
+    """Поле message из JSON-ответа API с ошибкой ('' если тела нет или это не JSON)."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    return payload.get("message", "") if isinstance(payload, dict) else ""
+
+
+def get_service_applications(settings: "SettingParams") -> tuple[Optional[list], Optional[str]]:
     """
     Получает список сервисных приложений организации.
     Спецификация API: https://yandex.ru/dev/api360/doc/ru/ref/ServiceApplicationsService/ServiceApplicationsService_Get
@@ -3924,21 +3885,22 @@ def get_service_applications(settings: "SettingParams") -> Optional[list]:
             response = requests.get(url, headers=headers)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
-                if response.json()['message'] == 'feature is not active':
+                message = _api_error_message(response)
+                if message == 'feature is not active':
                     logger.error('Функционал сервисных приложений не активирован в организации.')
-                    return None, response.json()['message']
-                if response.json()['message'] == 'Not an owner':
+                    return None, message
+                if message == 'Not an owner':
                     logger.error('Токен в параметре OAUTH_TOKEN_ARG выписан НЕ ВЛАДЕЛЬЦЕМ организации (с учеткой в @yandex.ru).')
                     logger.error('Невозможно настроить сервисное приложение. Получите правильный токен и повторите попытку.')
-                    return None, response.json()['message']
+                    return None, message
                 logger.error(f"Ошибка при получении списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
-                    logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
                     retries += 1
+                    logger.error(f"Повторная попытка ({retries}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                 else:
                     logger.error("Превышено максимальное количество попыток.")
-                    return None, response.json()['message']
+                    return None, message or f"HTTP {response.status_code}"
             else:
                 applications = response.json().get("applications", [])
                 logger.info(f"Получен список {len(applications)} сервисных приложений.")
@@ -4049,7 +4011,8 @@ def import_service_applications_api_data(settings: "SettingParams") -> bool:
             response = requests.post(url, headers=headers, json=payload)
             logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
             if response.status_code != HTTPStatus.OK.value:
-                if response.json()['message'] == 'feature is not active':
+                message = _api_error_message(response)
+                if message == 'feature is not active':
                     if not activated:
                         logger.error('Функционал сервисных приложений не активирован в организации. Выполняем активацию...')
                         result = activate_service_applications(settings)
@@ -4062,14 +4025,14 @@ def import_service_applications_api_data(settings: "SettingParams") -> bool:
                     else:
                         logger.error('Функционал сервисных приложений не активирован в организации. Проверьте настройки и повторите попытку.')
                         return False
-                if response.json()['message'] == 'Not an owner':
+                if message == 'Not an owner':
                     logger.error('Токен в параметре OAUTH_TOKEN_ARG выписан НЕ ВЛАДЕЛЬЦЕМ организации (с учеткой в @yandex.ru).')
                     logger.error('Невозможно настроить сервисное приложение. Получите правильный токен и повторите попытку.')
                     return False
                 logger.error(f"Ошибка при загрузке сервисных приложений из файла: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -4157,12 +4120,12 @@ def setup_service_application(settings: "SettingParams") -> bool:
             if not result:
                 logger.error("Не удалось активировать функционал сервисных приложений. Проверьте настройки и повторите попытку.")
                 return False
+            # После активации список приложений пуст — ниже приложение будет добавлено.
+            # Раньше здесь был len(None) -> TypeError, а для пустого списка настройка
+            # прерывалась, поэтому первое приложение в организации создать было нельзя.
+            applications = []
         else:
             return False
-
-    if len(applications) == 0:
-        logger.error("Список сервисных приложений пуст. Невозможно настроить сервисное приложение.")
-        return False
 
     client_id = settings.service_app_id
     required_permissions = SERVICE_APP_PERMISSIONS
@@ -4182,10 +4145,8 @@ def setup_service_application(settings: "SettingParams") -> bool:
                     logger.info("Добавлены недостающие разрешения для сервисного приложения.")
                 else:
                     logger.info("Сервисное приложение уже содержит все необходимые разрешения. Выполняем проверку валидности токена сервисного приложения...")
-                    check_service_app_status(settings)
+                    return check_service_app_status(settings)
                 break
-    else:
-        applications = []
 
     if not found:
         applications.append({
@@ -4211,7 +4172,7 @@ def setup_service_application(settings: "SettingParams") -> bool:
                 logger.error(f"Ошибка при обновлении сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -4230,7 +4191,7 @@ def setup_service_application(settings: "SettingParams") -> bool:
         return False
 
     logger.info(f"Сервисное приложение с ID {client_id} успешно настроено. Выполняем проверку валидности токена сервисного приложения...")
-    check_service_app_status(settings)
+    return check_service_app_status(settings)
     
 def delete_service_applications_list(settings: "SettingParams") -> bool:
     """
@@ -4249,7 +4210,7 @@ def delete_service_applications_list(settings: "SettingParams") -> bool:
                 logger.error(f"Ошибка при очистке списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -4281,7 +4242,7 @@ def deactivate_service_applications(settings: "SettingParams") -> bool:
                 logger.error(f"Ошибка при деактивации сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -4358,7 +4319,7 @@ def delete_service_application_from_list(settings: "SettingParams") -> bool:
                 logger.error(f"Ошибка при обновлении списка сервисных приложений: {response.status_code}. Сообщение: {response.text}")
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -4455,18 +4416,17 @@ def check_service_app_status(settings: "SettingParams", skip_permissions_check: 
         logger.error("Не найдено ни одного пользователя в организации. Невозможно проверить статус сервисного приложения.")
         return False
 
-    for u in users:
-        if u["isEnabled"]:
-            user = u
-            break
+    # Раньше при отсутствии активных пользователей переменная user оставалась
+    # неопределённой -> NameError
+    user = next((u for u in users if u.get("isEnabled")), None)
     if not user:
         logger.error("Не найдено ни одного пользователя в организации. Невозможно проверить статус сервисного приложения.")
         return False
     user_email = user.get('email', '')
     try:
         user_token = get_service_app_token(settings, user_email)
-    except Exception as e:
-        logger.error("Не удалось получить тестовый токен пользователя.")
+    except Exception as exc:
+        logger.error(f"Не удалось получить тестовый токен пользователя: {exc}")
         settings.service_app_status = False
         return False
 
@@ -4832,7 +4792,7 @@ def parse_ics_directory_menu(settings: SettingParams):
         for ics_file in ics_files:
             file_path = os.path.join(target_dir, ics_file)
             try:
-                with open(file_path, "r", encoding="utf-8") as ics_f:
+                with open(file_path, "r", encoding="utf-8-sig") as ics_f:
                     ics_text = html.unescape(ics_f.read())
             except Exception as exc:
                 logger.error(f"Ошибка чтения файла {ics_file}: {exc}")
@@ -4931,7 +4891,7 @@ def get_mail_routing_rules(settings: "SettingParams") -> Optional[list]:
                 )
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries + 1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -5024,7 +4984,7 @@ def set_mail_routing_rules(settings: "SettingParams", rules: list) -> bool:
                 )
                 if retries < MAX_RETRIES:
                     logger.error(f"Повторная попытка ({retries + 1}/{MAX_RETRIES})")
-                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    time.sleep(RETRIES_DELAY_SEC * (retries + 1))
                     retries += 1
                 else:
                     logger.error("Превышено максимальное количество попыток.")
@@ -5206,46 +5166,50 @@ def delete_mail_routing_rule(settings: "SettingParams", rule_to_delete: dict = N
     return True
 
 def main_menu(settings: "SettingParams"):
+    actions = {
+        "1": ("Выгрузить события из Яндекс 360 Календаря.", export_menu_parallel),
+        "2": ("Выгрузить события из внешнего сервера CalDAV.", export_from_external_caldav_server),
+        "3": ("Импортировать все события.", import_menu_parallel),
+        "4": ("Вывести список слоёв календарей пользователей.", list_calendars_for_user),
+        "5": ("Парсинг .ics файлов в каталоге (CSV-отчёт).", parse_ics_directory_menu),
+        "6": ("Применить правила модификации к файлам .ics.", apply_rules_to_files_menu),
+        # Раньше этот пункт был недостижим: в main_menu стояли две ветки choice == "3"
+        "7": ("Импортировать все события для всех пользователей без вопросов (новый UID при конфликте).",
+              import_menu_parallel_without_params),
+        "8": ("Настроить правила обработки писем для блокировки уведомлений удаления событий.", mail_routing_rules_menu),
+        "9": ("Настройка сервисного приложения.", service_application_status_menu),
+    }
+    hidden_actions = {
+        "666": delete_menu_parallel,
+    }
     while True:
         print("\n")
         print("Выберите опцию:")
-        print("1. Выгрузить события из Яндекс 360 Календаря.")
-        print("2. Выгрузить события из внешнего сервера CalDAV.")
-        print("3. Импортировать все события.")
-        print("4. Вывести список слоёв календарей пользователей.")
-        print("5. Парсинг .ics файлов в каталоге (CSV-отчёт).")
-        print("6. Применить правила модификации к файлам .ics.") 
-        print("8. Настроить правила обработки писем для блокировки уведомлений удаления событий.")
-        print("9. Настройка сервисного приложения.")
+        for key, (title, _func) in actions.items():
+            print(f"{key}. {title}")
         print("0. (Ctrl+C) Выход")
         print("\n")
-        choice = input("Введите ваш выбор (0-6,8,9): ")
+        choice = input("Введите ваш выбор (0-9): ").strip()
 
         if choice == "0":
             print("До свидания!")
             break
-        if choice == "1":
-            export_menu_parallel(settings)
-        elif choice == "2":
-            export_from_external_caldav_server(settings)
-        elif choice == "3":
-            import_menu_parallel(settings)
-        elif choice == "3":
-            import_menu_parallel_without_params(settings)
-        elif choice == "4":
-            list_calendars_for_user(settings)
-        elif choice == "5":
-            parse_ics_directory_menu(settings)
-        elif choice == "6":
-            apply_rules_to_files_menu(settings)
-        elif choice == "8":
-            mail_routing_rules_menu(settings)
-        elif choice == "9":
-            service_application_status_menu(settings)
-        elif choice == "666":
-            delete_menu_parallel(settings)
-        else:
+        func = actions[choice][1] if choice in actions else hidden_actions.get(choice)
+        if func is None:
             logger.error("Неверный выбор. Попробуйте снова.")
+            continue
+        # Ошибка в одном пункте меню больше не завершает скрипт целиком
+        try:
+            func(settings)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            tb = traceback.extract_tb(exc.__traceback__)
+            last_frame = tb[-1] if tb else None
+            location = f" at {last_frame.filename}:{last_frame.lineno} in {last_frame.name}" if last_frame else ""
+            logger.error(f"{type(exc).__name__}{location}: {exc}")
+            logger.debug(traceback.format_exc())
+
 
 def service_application_status_menu(settings: SettingParams):
     while True:
